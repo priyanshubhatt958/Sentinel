@@ -1,0 +1,214 @@
+services:
+  database:
+    image: postgres:16-alpine
+    container_name: cloud-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cloud_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cloud_password}
+      POSTGRES_DB: ${POSTGRES_DB:-cloud_self_healing}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cloud_user} -d ${POSTGRES_DB:-cloud_self_healing}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  payment-service:
+    build:
+      context: ./services/payment-service
+    restart: unless-stopped
+    environment:
+      PORT: 8002
+      SERVICE_NAME: payment-service
+      DATABASE_HOST: database
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ${POSTGRES_DB:-cloud_self_healing}
+      DATABASE_USER: ${POSTGRES_USER:-cloud_user}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-cloud_password}
+      NODE_ENV: production
+    ports:
+      - "8002"
+    deploy:
+      replicas: 2
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8002/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+  order-service:
+    build:
+      context: ./services/order-service
+    container_name: order-service
+    restart: unless-stopped
+    environment:
+      PORT: 8001
+      SERVICE_NAME: order-service
+      PAYMENT_SERVICE_URL: http://payment-service:8002
+      DATABASE_HOST: database
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ${POSTGRES_DB:-cloud_self_healing}
+      DATABASE_USER: ${POSTGRES_USER:-cloud_user}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-cloud_password}
+      NODE_ENV: production
+    ports:
+      - "8001:8001"
+    depends_on:
+      database:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  user-service:
+    build:
+      context: ./services/user-service
+    container_name: user-service
+    restart: unless-stopped
+    environment:
+      PORT: 8003
+      SERVICE_NAME: user-service
+      DATABASE_HOST: database
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ${POSTGRES_DB:-cloud_self_healing}
+      DATABASE_USER: ${POSTGRES_USER:-cloud_user}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-cloud_password}
+      NODE_ENV: production
+    ports:
+      - "8003:8003"
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8003/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  load-generator:
+    build:
+      context: ./load-generator
+    container_name: load-generator
+    restart: unless-stopped
+    environment:
+      PORT: 8004
+      PAYMENT_SERVICE_URL: http://payment-service:8002/payments
+      ORDER_SERVICE_URL: http://order-service:8001/orders
+      USER_SERVICE_URL: http://user-service:8003/users
+      NODE_ENV: production
+    ports:
+      - "8004:8004"
+    depends_on:
+      payment-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8004/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  monitoring-backend:
+    build:
+      context: ./monitoring-backend
+    container_name: monitoring-backend
+    restart: unless-stopped
+    environment:
+      PORT: 5000
+      PGHOST: database
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:-cloud_user}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-cloud_password}
+      PGDATABASE: ${POSTGRES_DB:-cloud_self_healing}
+      ML_SERVICE_URL: http://ml-service:8000
+      LOAD_GENERATOR_URL: http://load-generator:8004
+      AUTO_RECOVERY_ENABLED: ${AUTO_RECOVERY_ENABLED:-false}
+      AUTO_RECOVERY_MAX_ACTIONS_PER_HOUR: ${AUTO_RECOVERY_MAX_ACTIONS_PER_HOUR:-5}
+      RECOVERY_VERIFICATION_DELAY_MS: ${RECOVERY_VERIFICATION_DELAY_MS:-10000}
+      MAX_SERVICE_REPLICAS: ${MAX_SERVICE_REPLICAS:-5}
+      MIN_SERVICE_REPLICAS: ${MIN_SERVICE_REPLICAS:-2}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GENAI_ENABLED: ${GENAI_ENABLED:-false}
+      GENAI_API_URL: ${GENAI_API_URL:-https://api.openai.com/v1/chat/completions}
+      GENAI_MODEL: ${GENAI_MODEL:-gpt-4o-mini}
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-cloud-self-healing-system}
+      MONITORING_INTERVAL_MS: ${MONITORING_INTERVAL_MS:-5000}
+      MONITORING_PROBE_TIMEOUT_MS: ${MONITORING_PROBE_TIMEOUT_MS:-3000}
+      MONITORING_RETENTION_DAYS: ${MONITORING_RETENTION_DAYS:-7}
+      NODE_ENV: production
+    ports:
+      - "5000:5000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      database:
+        condition: service_healthy
+      ml-service:
+        condition: service_healthy
+      load-generator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:5000/api/services/status').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  ml-service:
+    build:
+      context: ./ml-service
+    container_name: ml-service
+    restart: unless-stopped
+    environment:
+      PORT: 8000
+      PYTHONUNBUFFERED: 1
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GENAI_ENABLED: ${GENAI_ENABLED:-false}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/ml/health').read()\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: http://localhost:5000
+    ports:
+      - "5173:5173"
+    depends_on:
+      monitoring-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:5173').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
+volumes:
+  postgres_data:
