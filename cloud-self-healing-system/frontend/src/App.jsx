@@ -1,4 +1,5 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import './App.css';
 import {
   Area,
   AreaChart,
@@ -19,15 +20,13 @@ const serviceColors = {
   'order-service': '#3b82f6',
   'user-service': '#10b981'
 };
-const businessServices = Object.keys(serviceColors);
 
 async function fetchJson(url) {
   const response = await fetch(url);
-  const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.error || payload.message || `Request failed: ${response.status}`);
+    throw new Error(`Request failed: ${response.status}`);
   }
-  return payload;
+  return response.json();
 }
 
 function formatNumber(value, digits = 1) {
@@ -37,216 +36,26 @@ function formatNumber(value, digits = 1) {
   return Number(value).toFixed(digits);
 }
 
-function formatMetricTime(point) {
-  const timestamp = [point.collected_at, point.created_at, point.timestamp]
-    .find((value) => value !== null && value !== undefined && value !== '');
-  if (!timestamp) return '';
-  const date = new Date(timestamp);
-  return Number.isNaN(date.getTime())
-    ? ''
-    : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function formatTimestamp(value) {
-  if (!value) return '—';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime())
-    ? String(value)
-    : date.toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
-}
-
-const lifecycleLabels = {
-  manual_intervention_required: 'Manual intervention required',
-  verification_pending: 'Verification pending',
-  partially_recovered: 'Partially recovered',
-  not_recovered: 'Not recovered',
-  planned: 'Planned',
-  skipped: 'Skipped',
-  blocked: 'Blocked',
-  recovered: 'Recovered',
-  failed: 'Failed',
-  expired: 'Expired'
-};
-
-function lifecycleLabel(value) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
-  return lifecycleLabels[normalized]
-    || normalized.split('_').filter(Boolean).map((word) => `${word[0].toUpperCase()}${word.slice(1)}`).join(' ')
-    || 'Unknown';
-}
-
-const auditFieldGroups = [
-  {
-    title: 'Decision, safety & replica limits',
-    fields: [
-      [['root_cause', 'rootCause'], 'Root cause'],
-      [['action_type', 'actionType', 'action'], 'Selected action'],
-      [['decision_reason', 'decisionReason', 'reason'], 'Decision reason'],
-      [['decision_confidence', 'decisionConfidence', 'confidence'], 'Decision confidence'],
-      [['recommendation'], 'Recommendation'],
-      [['safety', 'safety_details', 'safetyDetails'], 'Safety details'],
-      [['safety_checks', 'safetyChecks'], 'Safety checks'],
-      [['safety_check', 'safetyCheck', 'safety_status', 'safetyStatus', 'safety_reason', 'safetyReason'], 'Safety result'],
-      [['replica_check', 'replicaCheck', 'replica_guard', 'replicaGuard', 'replica_limit_check', 'replicaLimitCheck'], 'Replica limit check'],
-      [['replica_limit', 'replicaLimit'], 'Replica limit'],
-      [['min_service_replicas', 'minServiceReplicas', 'min_replicas', 'minReplicas'], 'Minimum replicas'],
-      [['max_service_replicas', 'maxServiceReplicas', 'max_replicas', 'maxReplicas'], 'Maximum replicas'],
-      [['previous_replicas', 'previousReplicas'], 'Previous replicas'],
-      [['new_replicas', 'newReplicas'], 'New replicas'],
-      [['replica_change', 'replicaChange'], 'Replica change'],
-      [['cooldown_started_at', 'cooldownStartedAt'], 'Cooldown started'],
-      [['cooldown_until', 'cooldownUntil'], 'Cooldown until']
-    ]
-  },
-  {
-    title: 'Metrics & verification',
-    fields: [
-      [['before_metrics', 'beforeMetrics'], 'Before metrics'],
-      [['after_metrics', 'afterMetrics'], 'After metrics'],
-      [['verification_samples', 'verificationSamples', 'samples'], 'Verification samples'],
-      [['samples_used', 'samplesUsed', 'verification_sample_count', 'verificationSampleCount', 'sample_count', 'sampleCount'], 'Verification sample count'],
-      [['verification_window', 'verificationWindow', 'verification_window_ms', 'verificationWindowMs', 'verification_window_seconds', 'verificationWindowSeconds'], 'Verification window'],
-      [['verification_started_at', 'verificationStartedAt', 'verification_window_start', 'verificationWindowStart', 'verification_window_started_at', 'verificationWindowStartedAt'], 'Verification started'],
-      [['verification_completed_at', 'verificationCompletedAt', 'verification_window_end', 'verificationWindowEnd', 'verification_window_ended_at', 'verificationWindowEndedAt'], 'Verification completed'],
-      [['effectiveness_by_metric', 'effectivenessByMetric'], 'Metric improvement details'],
-      [['metric_improvements', 'metricImprovements'], 'Metric improvements'],
-      [['effectiveness_score', 'effectivenessScore'], 'Effectiveness score']
-    ]
-  },
-  {
-    title: 'Execution',
-    fields: [
-      [['execution_details', 'executionDetails'], 'Execution details'],
-      [['execution_started_at', 'executionStartedAt', 'started_at', 'startedAt'], 'Execution started'],
-      [['execution_completed_at', 'executionCompletedAt', 'completed_at', 'completedAt'], 'Execution completed'],
-      [['execution_result', 'executionResult', 'result'], 'Execution result'],
-      [['execution_status', 'executionStatus'], 'Execution status'],
-      [['message'], 'Execution message'],
-      [['triggered_by', 'triggeredBy'], 'Triggered by'],
-      [['created_at', 'createdAt', 'timestamp'], 'Record created'],
-      [['updated_at', 'updatedAt'], 'Last updated']
-    ]
-  },
-  {
-    title: 'Errors',
-    fields: [
-      [['error_details', 'errorDetails', 'error'], 'Error details']
-    ]
-  }
-];
-
-function auditValue(record, keys) {
-  return keys.map((key) => record?.[key]).find((value) => (
-    value !== null && value !== undefined && value !== ''
-  ));
-}
-
-function hasValue(value) {
-  if (value === null || value === undefined || value === '') return false;
-  if (Array.isArray(value) || (typeof value === 'object' && value !== null)) {
-    return Object.keys(value).length > 0;
-  }
-  return true;
-}
-
-function hasMetricSnapshot(value) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    && Object.values(value).some((metric) => metric !== null && metric !== undefined);
-}
-
-function formatAuditValue(value, label) {
-  if (value && typeof value === 'object') {
-    return <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '0.35rem 0 0' }}>{JSON.stringify(value, null, 2)}</pre>;
-  }
-  if (/(started|completed|created|updated|until|timestamp)/i.test(label)) {
-    return formatTimestamp(value);
-  }
-  return String(value);
-}
-
-function AuditDetails({ record }) {
-  const beforeMetrics = auditValue(record, ['before_metrics', 'beforeMetrics']);
-  const afterMetrics = auditValue(record, ['after_metrics', 'afterMetrics']);
-  const hasMetrics = hasMetricSnapshot(beforeMetrics) || hasMetricSnapshot(afterMetrics);
-  const status = String(record.status || record.recovery_status || record.recoveryStatus || '').toLowerCase();
-  const reason = String(auditValue(record, ['decision_reason', 'decisionReason', 'reason', 'message']) || '');
-  const decisionMessage = status === 'manual_intervention_required'
-    ? reason.includes('Application-only recovery cannot repair')
-      ? 'Database remediation required'
-      : 'Manual intervention required'
-    : status === 'skipped'
-      ? 'No safe recovery action available'
-      : status === 'blocked'
-        ? reason.includes('maximum replica limit')
-          ? 'Scaling blocked: maximum replica limit reached'
-          : 'Recovery action blocked'
-        : status === 'planned' ? 'Awaiting execution' : null;
-
-  return (
-    <div className="audit-details">
-      {decisionMessage && !record.execution_details && !record.executionDetails && (
-        <p className="muted" style={{ marginTop: 0 }}>{decisionMessage} · Decision-only action · No recovery action executed.</p>
-      )}
-      {!hasMetrics && (
-        <p className="muted" style={{ marginTop: 0 }}>
-          No before/after metric snapshots were recorded for this entry.
-        </p>
-      )}
-      {auditFieldGroups.map((group) => {
-        const fields = group.fields
-          .map(([keys, label]) => ({ label, value: auditValue(record, keys) }))
-          .filter(({ label, value }) => (
-            label === 'Before metrics' || label === 'After metrics'
-              ? hasMetricSnapshot(value)
-              : hasValue(value)
-          ));
-        if (!fields.length) return null;
-        return (
-          <section className="audit-group" key={group.title}>
-            <h4>{group.title}</h4>
-            <dl className="audit-grid">
-              {fields.map(({ label, value }) => (
-                <div className="audit-field" key={label}>
-                  <dt>{label}</dt>
-                  <dd>{formatAuditValue(value, label)}</dd>
-                </div>
-              ))}
-            </dl>
-          </section>
-        );
-      })}
-    </div>
-  );
-}
-
 function StatusBadge({ value }) {
-  const normalized = String(value || '').toLowerCase().replace(/[\s-]+/g, '_');
+  const normalized = String(value || '').toLowerCase();
   const palette = {
-    healthy: { bg: '#dcfce7', text: '#166534' },
-    warning: { bg: '#fef3c7', text: '#92400e' },
-    critical: { bg: '#fee2e2', text: '#991b1b' },
-    unhealthy: { bg: '#f3f4f6', text: '#374151' },
-    recovered: { bg: '#dbeafe', text: '#1d4ed8' },
-    partially_recovered: { bg: '#fef3c7', text: '#a16207' },
-    partial: { bg: '#fef3c7', text: '#a16207' },
-    not_recovered: { bg: '#fee2e2', text: '#991b1b' },
-    manual_intervention_required: { bg: '#ffedd5', text: '#9a3412' },
-    verification_pending: { bg: '#dbeafe', text: '#1d4ed8' },
-    planned: { bg: '#e2e8f0', text: '#334155' },
-    skipped: { bg: '#e2e8f0', text: '#334155' },
-    blocked: { bg: '#fee2e2', text: '#991b1b' },
-    expired: { bg: '#fef3c7', text: '#92400e' },
-    degraded: { bg: '#fef3c7', text: '#92400e' },
-    failed: { bg: '#fee2e2', text: '#991b1b' },
-    unavailable: { bg: '#fee2e2', text: '#991b1b' },
-    active: { bg: '#dcfce7', text: '#166534' },
-    enabled: { bg: '#dcfce7', text: '#166534' },
-    running: { bg: '#dcfce7', text: '#166534' },
-    stopped: { bg: '#e2e8f0', text: '#334155' },
-    disabled: { bg: '#e2e8f0', text: '#334155' }
+    healthy: { bg: 'var(--badge-healthy-bg)', text: 'var(--badge-healthy-text)' },
+    warning: { bg: 'var(--badge-warning-bg)', text: 'var(--badge-warning-text)' },
+    critical: { bg: 'var(--badge-critical-bg)', text: 'var(--badge-critical-text)' },
+    unhealthy: { bg: 'var(--badge-neutral-bg)', text: 'var(--badge-neutral-text)' },
+    recovered: { bg: 'var(--badge-info-bg)', text: 'var(--badge-info-text)' },
+    partial: { bg: 'var(--badge-warning-bg)', text: 'var(--badge-warning-text)' },
+    stable: { bg: 'var(--badge-healthy-bg)', text: 'var(--badge-healthy-text)' },
+    attention: { bg: 'var(--badge-warning-bg)', text: 'var(--badge-warning-text)' },
+    enabled: { bg: 'var(--badge-healthy-bg)', text: 'var(--badge-healthy-text)' },
+    disabled: { bg: 'var(--badge-neutral-bg)', text: 'var(--badge-neutral-text)' },
+    running: { bg: 'var(--badge-info-bg)', text: 'var(--badge-info-text)' },
+    ready: { bg: 'var(--badge-healthy-bg)', text: 'var(--badge-healthy-text)' },
+    active: { bg: 'var(--badge-info-bg)', text: 'var(--badge-info-text)' },
+    stopped: { bg: 'var(--badge-neutral-bg)', text: 'var(--badge-neutral-text)' }
   };
 
-  const style = palette[normalized] || { bg: '#e2e8f0', text: '#334155' };
+  const style = palette[normalized] || { bg: 'var(--badge-neutral-bg)', text: 'var(--badge-neutral-text)' };
 
   return (
     <span
@@ -257,26 +66,28 @@ function StatusBadge({ value }) {
         background: style.bg,
         color: style.text,
         fontWeight: 700,
+        textTransform: 'capitalize'
       }}
     >
-      {lifecycleLabel(value)}
+      {value || 'unknown'}
     </span>
   );
 }
 
-function hasSafeRecoveryAction(incident) {
-  const type = incident.incident_type || incident.incidentType;
-  const rootCause = incident.root_cause || incident.rootCause;
-  if (type === 'database_bottleneck') return false;
-  if (['traffic_spike', 'cpu_overload', 'memory_leak'].includes(type)) {
-    return rootCause === 'payment-service';
-  }
-  if (type === 'network_failure') {
-    const allowlisted = new Set(businessServices);
-    return allowlisted.has(incident.service_name)
-      || (incident.affected_services || []).some((service) => allowlisted.has(service));
-  }
-  return false;
+function TabIcon({ name }) {
+  const icons = {
+    overview: <><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></>,
+    monitoring: <><path d="M3 12h4l2.5-6 5 12 2.5-6H21" /></>,
+    analytics: <><path d="M4 20V10" /><path d="M10 20V4" /><path d="M16 20v-7" /><path d="M22 20H2" /></>,
+    incidents: <><path d="M12 9v4" /><path d="M12 17h.01" /><path d="M10.3 3.7 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z" /></>,
+    recovery: <><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 4v7h-7" /></>
+  };
+
+  return (
+    <svg className="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      {icons[name]}
+    </svg>
+  );
 }
 
 function App() {
@@ -284,43 +95,19 @@ function App() {
   const [metricsByService, setMetricsByService] = useState({});
   const [incidents, setIncidents] = useState([]);
   const [loadStatus, setLoadStatus] = useState(null);
-  const [simulationStatus, setSimulationStatus] = useState(null);
-  const [monitoringHealth, setMonitoringHealth] = useState(null);
-  const [loadForm, setLoadForm] = useState({
-    targetService: 'payment-service',
-    requestsPerSecond: 50,
-    durationSeconds: 60,
-    scenario: 'traffic-spike'
-  });
-  const [simulationDurationMs, setSimulationDurationMs] = useState(30000);
   const [recoveryActions, setRecoveryActions] = useState([]);
-  const [expandedRecoveryActionId, setExpandedRecoveryActionId] = useState(null);
   const [recoveryConfig, setRecoveryConfig] = useState({
     autoRecoveryEnabled: false,
     maxActionsPerHour: 5,
-    cooldownMs: 120000,
-    maxActionsPerIncident: 3,
-    maxActionsPerServicePerHour: 5,
-    maxFailuresBeforeManual: 3,
-    verificationDelayMs: 30000,
-    verificationSamples: 6,
+    verificationDelayMs: 10000,
     maxServiceReplicas: 5,
-    minServiceReplicas: 1
+    minServiceReplicas: 2
   });
   const [recoveringIncidentId, setRecoveringIncidentId] = useState(null);
-  const [incidentDetail, setIncidentDetail] = useState(null);
-  const [loadingIncidentDetail, setLoadingIncidentDetail] = useState(false);
   const [activeOnly, setActiveOnly] = useState(false);
   const [dependencyGraph, setDependencyGraph] = useState({
-    nodes: ['frontend', 'monitoring-backend', 'load-generator', 'user-service', 'order-service', 'payment-service', 'database', 'ml-service'],
+    nodes: ['user-service', 'order-service', 'payment-service', 'database'],
     edges: [
-      { source: 'frontend', target: 'monitoring-backend' },
-      { source: 'monitoring-backend', target: 'load-generator' },
-      { source: 'monitoring-backend', target: 'ml-service' },
-      { source: 'monitoring-backend', target: 'database' },
-      { source: 'load-generator', target: 'user-service' },
-      { source: 'load-generator', target: 'order-service' },
-      { source: 'load-generator', target: 'payment-service' },
       { source: 'user-service', target: 'order-service' },
       { source: 'order-service', target: 'payment-service' },
       { source: 'payment-service', target: 'database' }
@@ -333,7 +120,16 @@ function App() {
   const [error, setError] = useState('');
   const [lastRefreshAt, setLastRefreshAt] = useState(null);
   const [stale, setStale] = useState(false);
+  const [activeTab, setActiveTab] = useState('overview');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [theme, setTheme] = useState(() => window.localStorage.getItem('sentinel-theme') || 'dark');
   const requestInFlight = useRef(false);
+
+  useEffect(() => {
+    const activeTheme = theme === 'light' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = activeTheme;
+    window.localStorage.setItem('sentinel-theme', activeTheme);
+  }, [theme]);
 
   const loadDashboard = async () => {
     if (requestInFlight.current) return;
@@ -346,11 +142,9 @@ function App() {
       ]);
       const graphResponse = await fetchJson(`${API_BASE}/api/dependency-graph`).catch(() => null);
       const loadResponse = await fetchJson(`${API_BASE}/api/load/status`).catch(() => null);
-      const [recoveryConfigResponse, recoveryActionsResponse, simulationResponse, healthResponse] = await Promise.all([
+      const [recoveryConfigResponse, recoveryActionsResponse] = await Promise.all([
         fetchJson(`${API_BASE}/api/recovery/config`).catch(() => null),
-        fetchJson(`${API_BASE}/api/recovery/actions`).catch(() => []),
-        fetchJson(`${API_BASE}/api/simulations/status`).catch(() => null),
-        fetchJson(`${API_BASE}/api/monitoring/health`).catch(() => null)
+        fetchJson(`${API_BASE}/api/recovery/actions`).catch(() => [])
       ]);
 
       setServiceStatus(statusResponse.services || []);
@@ -359,13 +153,11 @@ function App() {
         setDependencyGraph(graphResponse);
       }
       if (loadResponse) setLoadStatus(loadResponse);
-      setSimulationStatus(simulationResponse);
-      setMonitoringHealth(healthResponse);
       if (recoveryConfigResponse) setRecoveryConfig(recoveryConfigResponse);
       setRecoveryActions(recoveryActionsResponse || []);
 
       const metricsMap = {};
-      for (const service of businessServices) {
+      for (const service of ['payment-service', 'order-service', 'user-service']) {
         try {
           const response = await fetchJson(`${API_BASE}/api/metrics/history?service=${service}&minutes=30`);
           metricsMap[service] = response || [];
@@ -394,7 +186,7 @@ function App() {
 
   const latestMetrics = useMemo(() => {
     const values = {};
-    for (const service of businessServices) {
+    for (const service of ['payment-service', 'order-service', 'user-service']) {
       const list = metricsByService[service] || [];
       values[service] = list[list.length - 1] || null;
     }
@@ -408,50 +200,34 @@ function App() {
   const selectedDependents = dependencyGraph.edges
     .filter((edge) => edge.target === selectedDependency)
     .map((edge) => edge.source);
-  const activeRecoveryStatuses = new Set([
-    'pending', 'open', 'planned', 'executing', 'executed',
-    'verification_pending', 'in_progress', 'partially_recovered',
-    'not_recovered', 'blocked', 'skipped', 'manual_intervention_required'
-  ]);
-  const currentIncidentCutoff = Date.now() - 30 * 60 * 1000;
-  const currentIncidents = incidents.filter((incident) => {
-    const updatedAt = new Date(incident.updated_at || incident.created_at).getTime();
-    return activeRecoveryStatuses.has(incident.recovery_status) && updatedAt >= currentIncidentCutoff;
-  });
-  const recentRecoveryActions = recoveryActions.filter((action) => {
-    const createdAt = new Date(action.created_at).getTime();
-    return createdAt >= currentIncidentCutoff && ![
-      'skipped', 'blocked', 'manual_intervention_required', 'no_safe_action',
-      'max_replicas_reached', 'requires_database_remediation', 'rate_limited', 'cooldown'
-    ].includes(action.status);
-  });
 
   const chartData = selectedHistory.map((point, index) => ({
     index,
-    time: formatMetricTime(point),
+    time: new Date(point.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     latency: Number(point.probe_latency_ms || 0),
     cpu: Number(point.cpu_percent || 0),
     memory: Number(point.memory_percent || 0),
     probeFailed: point.probe_ok === false ? 1 : 0
   }));
 
-  const systemHealth = currentIncidents.length === 0
-    && serviceStatus.filter((entry) => entry.service !== 'database').every((entry) => entry.state === 'running' && entry.health === 'healthy')
+  const systemHealth = serviceStatus.filter((entry) => entry.service !== 'database').every((entry) => entry.state === 'running' && entry.health === 'healthy')
     ? 'Stable'
     : 'Attention';
 
   const selectedProbeFailures = selectedHistory.filter((point) => point.probe_ok === false).length;
+  const viewHeadings = {
+    overview: ['Control Center', 'A live overview of service health and resilience.'],
+    monitoring: ['System Monitoring', 'Inspect services, dependencies, and traffic controls.'],
+    analytics: ['Performance Analytics', 'Explore recent latency, probe, and memory trends.'],
+    incidents: ['Incident Timeline', 'Review detected issues and coordinate recovery.'],
+    recovery: ['Recovery Activity', 'Track automated and manual remediation actions.']
+  };
+  const [pageTitle, pageSubtitle] = viewHeadings[activeTab];
 
-  const triggerSimulation = async (endpoint, body = {}) => {
+  const triggerSimulation = async (endpoint) => {
     try {
       setSimulating(true);
-      const response = await fetch(`${API_BASE}${endpoint}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload.error || 'Simulation failed.');
+      await fetch(`${API_BASE}${endpoint}`, { method: 'POST' });
       await loadDashboard();
     } catch (simulationError) {
       setError(simulationError.message || 'Simulation failed.');
@@ -467,9 +243,10 @@ function App() {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          ...loadForm,
-          requestsPerSecond: Number(loadForm.requestsPerSecond),
-          durationSeconds: Number(loadForm.durationSeconds)
+          targetService: 'payment-service',
+          requestsPerSecond: 50,
+          durationSeconds: 60,
+          scenario: 'traffic-spike'
         })
       });
       const payload = await response.json();
@@ -521,7 +298,6 @@ function App() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.message || payload.error || 'Manual recovery failed.');
       await loadDashboard();
-      if (incidentDetail?.id === incidentId) await openIncidentDetail(incidentId);
     } catch (recoveryError) {
       setError(recoveryError.message || 'Manual recovery failed.');
     } finally {
@@ -529,141 +305,102 @@ function App() {
     }
   };
 
-  const openIncidentDetail = async (incidentId) => {
-    try {
-      setLoadingIncidentDetail(true);
-        const [incident, summary, timeline, auditRecords] = await Promise.all([
-        fetchJson(`${API_BASE}/api/incidents/${incidentId}`),
-        fetchJson(`${API_BASE}/api/incidents/${incidentId}/summary`),
-        fetchJson(`${API_BASE}/api/incidents/${incidentId}/recovery-timeline`),
-        fetchJson(`${API_BASE}/api/recovery/actions?incidentId=${encodeURIComponent(incidentId)}`).catch(() => [])
-      ]);
-      const timelineWithAudit = Array.isArray(timeline)
-        ? timeline.map((entry) => ({
-          ...(auditRecords.find((record) => String(record.id) === String(entry.id)) || {}),
-          ...entry
-        }))
-        : timeline;
-      setIncidentDetail({ ...incident, summary, timeline: timelineWithAudit });
-      setError('');
-    } catch (detailError) {
-      setError(detailError.message || 'Unable to load incident details.');
-    } finally {
-      setLoadingIncidentDetail(false);
-    }
-  };
-
-  const incidentAffectedServices = new Set(currentIncidents.flatMap((incident) => incident.affected_services || []));
-  const incidentRootCauses = new Set(currentIncidents.map((incident) => incident.root_cause).filter(Boolean));
-  const recoveryTargets = new Set(recentRecoveryActions.map((action) => action.target_service));
-
-  const dependencyStatus = (node) => {
-    if (incidentDetail?.root_cause === node || incidentRootCauses.has(node)) return 'critical';
-    if (recoveryTargets.has(node)) return 'recovery-target';
-    if (incidentAffectedServices.has(node)) return 'incident-affected';
-    if (node === 'ml-service') return monitoringHealth?.mlIntegration?.available === false ? 'unavailable' : 'healthy';
-    if (node === 'monitoring-backend') return monitoringHealth?.status || 'unavailable';
-    if (node === 'load-generator') return loadStatus?.active ? 'healthy' : 'degraded';
-    if (node === 'frontend') return 'healthy';
-    const service = serviceStatus.find((entry) => entry.service === node);
-    if (service?.health === 'healthy') return 'healthy';
-    if (service?.state === 'unavailable' || !service) return 'unavailable';
-    return 'degraded';
-  };
-
-  const dependencyColors = {
-    healthy: '#16a34a',
-    degraded: '#ca8a04',
-    unavailable: '#dc2626',
-    critical: '#dc2626',
-    'incident-affected': '#ea580c',
-    'recovery-target': '#2563eb'
-  };
-
   return (
     <>
-      <style>{`
-        * { box-sizing: border-box; }
-        body { margin: 0; font-family: Inter, Arial, sans-serif; background: #f8fafc; color: #0f172a; }
-        .page { padding: 2rem; max-width: 1400px; margin: 0 auto; }
-        .topbar { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: 1.5rem; }
-        .title { font-size: 2rem; font-weight: 800; margin: 0; }
-        .subtitle { color: #475569; margin: 0.25rem 0 0; }
-        .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
-        .card { background: white; border: 1px solid #e2e8f0; border-radius: 18px; padding: 1rem 1.1rem; box-shadow: 0 8px 25px rgba(15, 23, 42, 0.04); }
-        .stat-label { font-size: 0.8rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; }
-        .stat-value { font-size: 1.8rem; font-weight: 800; margin-top: 0.4rem; }
-        .panel { background: white; border: 1px solid #e2e8f0; border-radius: 18px; padding: 1rem 1.1rem; margin-bottom: 1.5rem; }
-        .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
-        .button-row { display: flex; flex-wrap: wrap; gap: 0.75rem; }
-        .load-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; }
-        .load-stat { padding: 0.75rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; }
-        .load-stat strong { display: block; margin-top: 0.25rem; font-size: 1.1rem; }
-        .recovery-config { display: flex; align-items: center; gap: 0.65rem; font-weight: 700; }
-        .action-btn { border: none; border-radius: 10px; padding: 0.7rem 1rem; background: #0f172a; color: white; cursor: pointer; font-weight: 700; transition: transform 180ms ease, box-shadow 180ms ease, background-color 180ms ease, color 180ms ease; }
-        .action-btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 14px rgba(15, 23, 42, 0.16); }
-        .action-btn:active:not(:disabled) { transform: translateY(0) scale(0.98); box-shadow: 0 2px 5px rgba(15, 23, 42, 0.12); }
-        .action-btn:focus-visible { outline: 3px solid #38bdf8; outline-offset: 3px; }
-        .action-btn:disabled { cursor: wait; opacity: 0.65; }
-        .action-btn.secondary { background: #e2e8f0; color: #0f172a; }
-        @media (prefers-reduced-motion: reduce) { .action-btn { transition: none; } }
-        .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 1.25rem; }
-        .dependency-list { display: grid; gap: 0.25rem; }
-        .dependency-node { width: 100%; padding: 0.7rem 0.8rem; border: 1px solid #cbd5e1; border-radius: 8px; background: #f8fafc; color: #0f172a; text-align: left; font: inherit; font-weight: 700; cursor: pointer; transition: background-color 160ms ease, border-color 160ms ease, transform 160ms ease; }
-        .dependency-node:hover { transform: translateX(2px); border-color: #0f766e; }
-        .dependency-node:focus-visible { outline: 3px solid #0f766e; outline-offset: 2px; }
-        .dependency-node.selected { background: #ccfbf1; border-color: #0f766e; }
-        .dependency-arrow { color: #64748b; padding: 0.15rem 0.8rem; line-height: 1; }
-        .dependency-node { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; }
-        .node-state { width: 0.7rem; height: 0.7rem; border-radius: 50%; flex: 0 0 auto; }
-        .control-row { display: flex; flex-wrap: wrap; align-items: end; gap: 0.75rem; margin-bottom: 0.9rem; }
-        .control-field { display: grid; gap: 0.3rem; color: #475569; font-size: 0.85rem; font-weight: 700; }
-        .control-field input, .control-field select { min-width: 130px; padding: 0.55rem; border: 1px solid #cbd5e1; border-radius: 8px; color: #0f172a; background: white; }
-        .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.75rem; }
-        .detail-item { padding: 0.75rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; overflow-wrap: anywhere; }
-        .timeline-item { border-left: 3px solid #0f766e; padding: 0.25rem 0 0.75rem 0.9rem; margin: 0.5rem 0; }
-        .audit-details { margin-top: 0.75rem; padding: 0.75rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; }
-        .audit-group + .audit-group { margin-top: 0.8rem; }
-        .audit-group h4 { margin: 0 0 0.45rem; color: #334155; }
-        .audit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.55rem; margin: 0; }
-        .audit-field { min-width: 0; padding: 0.55rem; background: white; border: 1px solid #e2e8f0; border-radius: 8px; overflow-wrap: anywhere; }
-        .audit-field dt { color: #64748b; font-size: 0.76rem; font-weight: 700; }
-        .audit-field dd { margin: 0.25rem 0 0; }
-        .expand-action { border: 0; padding: 0; background: transparent; color: #0369a1; font: inherit; font-weight: 700; cursor: pointer; text-align: left; }
-        .expand-action:focus-visible { outline: 3px solid #38bdf8; outline-offset: 3px; }
-        .recovery-detail-row td { padding: 0.75rem; background: #f8fafc; }
-        @media (prefers-reduced-motion: reduce) { .dependency-node { transition: none; } }
-        .service-list { display: grid; gap: 0.8rem; }
-        .service-item { display: flex; justify-content: space-between; align-items: center; padding: 0.85rem 1rem; border: 1px solid #e2e8f0; border-radius: 12px; cursor: pointer; }
-        .service-item.active { border-color: #38bdf8; background: #f0f9ff; }
-        .meter { margin-top: 0.75rem; height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
-        .meter-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, #22c55e, #f59e0b, #ef4444); }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 0.75rem 0.5rem; border-bottom: 1px solid #e2e8f0; text-align: left; }
-        th { font-size: 0.78rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; }
-        .muted { color: #64748b; }
-        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-      `}</style>
+      <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+        <aside className="sidebar">
+          <button
+            type="button"
+            className="sidebar-toggle"
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={!sidebarCollapsed}
+            onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              {sidebarCollapsed ? (
+                <><path d="m9 18 6-6-6-6" /></>
+              ) : (
+                <><path d="m15 18-6-6 6-6" /></>
+              )}
+            </svg>
+          </button>
+          <div className="sidebar-brand">
+            <div className="brand-mark" aria-hidden="true">S</div>
+            <div>
+              <strong>Sentinel</strong>
+              <span>Resilience OS</span>
+            </div>
+          </div>
 
-      <div className="page">
+          <nav className="tab-list" aria-label="Control center views">
+            {[
+              ['overview', 'Overview'],
+              ['monitoring', 'Monitoring'],
+              ['analytics', 'Analytics'],
+              ['incidents', 'Incidents'],
+              ['recovery', 'Recovery']
+            ].map(([tab, label]) => (
+              <button
+                key={tab}
+                type="button"
+                className={`tab-button ${activeTab === tab ? 'active' : ''}`}
+                title={sidebarCollapsed ? label : undefined}
+                aria-current={activeTab === tab ? 'page' : undefined}
+                onClick={() => setActiveTab(tab)}
+              >
+                <TabIcon name={tab} />
+                <span>{label}</span>
+              </button>
+            ))}
+          </nav>
+
+          <div className="sidebar-status">
+            <span className="sidebar-status-dot" />
+            <div>
+              <strong>{systemHealth}</strong>
+              <span>System status</span>
+            </div>
+          </div>
+        </aside>
+
+        <main className="page">
         <div className="topbar">
           <div>
-            <h1 className="title">AI-Powered Self-Healing Cloud Application</h1>
-            <p className="subtitle">Anomaly detection, dependency-aware root cause analysis, and automated recovery.</p>
+            <h1 className="title">{pageTitle}</h1>
+            <p className="subtitle">{pageSubtitle}</p>
           </div>
-          <StatusBadge value={systemHealth} />
+          <div className="topbar-actions">
+            <button
+              type="button"
+              className="theme-toggle"
+              aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+              onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                {theme === 'dark' ? (
+                  <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42" /></>
+                ) : (
+                  <><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z" /></>
+                )}
+              </svg>
+              <span>{theme === 'dark' ? 'Light mode' : 'Dark mode'}</span>
+            </button>
+            <StatusBadge value={systemHealth} />
+          </div>
         </div>
 
         {error && (
-          <div className="panel" style={{ borderColor: '#fca5a5', background: '#fff1f2' }}>
+          <div className="panel" style={{ borderColor: 'rgba(248, 113, 113, 0.4)', background: 'rgba(127, 29, 29, 0.18)', color: '#fecaca' }}>
             <strong>Connection issue:</strong> {error}
           </div>
         )}
 
-        <div className="muted" style={{ marginBottom: '1rem' }} aria-live="polite">
+        <div className={`muted refresh-status ${stale ? 'stale' : ''}`} style={{ marginBottom: '1rem' }} aria-live="polite">
           {stale ? 'Showing last known data; monitoring backend is unavailable.' : `Last refresh: ${lastRefreshAt ? lastRefreshAt.toLocaleTimeString() : 'loading...'}`}
         </div>
 
+        {activeTab === 'overview' && (
+          <div className="tab-content">
         <div className="cards">
           <div className="card">
             <div className="stat-label">Overall health</div>
@@ -674,35 +411,76 @@ function App() {
             <div className="stat-value">{incidents.length}</div>
           </div>
           <div className="card">
-            <div className="stat-label">Payment CPU / memory</div>
-            <div className="stat-value">{formatNumber(latestMetrics['payment-service']?.cpu_percent, 0)}% / {formatNumber(latestMetrics['payment-service']?.memory_percent, 0)}%</div>
+            <div className="stat-label">Active services</div>
+            <div className="stat-value">{serviceStatus.length}</div>
           </div>
           <div className="card">
-            <div className="stat-label">Payment request rate</div>
-            <div className="stat-value">{formatNumber(latestMetrics['payment-service']?.requests_per_second, 1)} req/s</div>
-          </div>
-          <div className="card">
-            <div className="stat-label">Payment error rate</div>
-            <div className="stat-value">{formatNumber(latestMetrics['payment-service']?.service_error_rate, 2)}%</div>
-          </div>
-          <div className="card">
-            <div className="stat-label">Payment probe latency</div>
-            <div className="stat-value">{formatNumber(latestMetrics['payment-service']?.probe_latency_ms, 0)} ms</div>
-          </div>
-          <div className="card">
-            <div className="stat-label">Database</div>
-            <div className="stat-value">{serviceStatus.find((entry) => entry.service === 'database')?.health || 'unknown'}</div>
-          </div>
-          <div className="card">
-            <div className="stat-label">ML integration</div>
-            <div className="stat-value">{monitoringHealth?.mlIntegration?.available === false ? 'Unavailable' : monitoringHealth?.mlIntegration?.available ? 'Ready' : 'Unknown'}</div>
-          </div>
-          <div className="card">
-            <div className="stat-label">Load generator</div>
-            <div className="stat-value">{loadStatus?.active ? 'Active' : 'Stopped'}</div>
+            <div className="stat-label">Risk level</div>
+            <div className="stat-value">{incidents[0]?.risk_level || 'LOW'}</div>
           </div>
         </div>
+        <div className="overview-grid">
+          <section className="panel overview-panel">
+            <div className="panel-header">
+              <div>
+                <h2 style={{ margin: 0 }}>Service health</h2>
+                <p className="overview-caption">Current state across monitored components</p>
+              </div>
+              <span className="overview-count">{serviceStatus.length} tracked</span>
+            </div>
+            <div className="overview-services">
+              {serviceStatus.length === 0 ? (
+                <p className="muted overview-empty">Service status is not available yet.</p>
+              ) : serviceStatus.map((service) => {
+                const metric = latestMetrics[service.service];
+                const health = service.health || 'unavailable';
+                return (
+                  <div className="overview-service" key={service.service}>
+                    <span className={`service-indicator ${String(health).toLowerCase()}`} aria-hidden="true" />
+                    <div className="overview-service-name">
+                      <strong>{service.service}</strong>
+                      <span>{service.state || 'unknown'}{metric ? ` · CPU ${formatNumber(metric.cpu_percent, 0)}%` : ''}</span>
+                    </div>
+                    <StatusBadge value={health} />
+                  </div>
+                );
+              })}
+            </div>
+          </section>
 
+          <section className="panel overview-panel incident-highlight">
+            <div className="panel-header">
+              <div>
+                <h2 style={{ margin: 0 }}>Latest incident</h2>
+                <p className="overview-caption">Most recently detected event</p>
+              </div>
+              {incidents[0] && <StatusBadge value={incidents[0].risk_level || incidents[0].riskLevel || 'LOW'} />}
+            </div>
+            {incidents[0] ? (
+              <div className="incident-summary">
+                <span className="incident-service">{incidents[0].service_name || incidents[0].service || 'Unknown service'}</span>
+                <strong>{incidents[0].incident_type || incidents[0].incidentType || 'Incident detected'}</strong>
+                <p>{incidents[0].root_cause || incidents[0].rootCause || 'Root cause analysis is pending.'}</p>
+                <span className="incident-time">
+                  {incidents[0].created_at ? new Date(incidents[0].created_at).toLocaleString() : 'Time unavailable'}
+                </span>
+              </div>
+            ) : (
+              <div className="incident-clear">
+                <span className="incident-clear-mark" aria-hidden="true">✓</span>
+                <div>
+                  <strong>No incidents recorded</strong>
+                  <span>The system has no recent events to report.</span>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+          </div>
+        )}
+
+        {activeTab === 'monitoring' && (
+          <div className="tab-content">
         <div className="panel">
           <div className="panel-header">
             <h2 style={{ margin: 0 }}>Recovery configuration</h2>
@@ -717,38 +495,23 @@ function App() {
             Enable Automatic Recovery
           </label>
           <div className="muted" style={{ marginTop: '0.5rem' }}>
-            Limit: {recoveryConfig.maxActionsPerHour} automatic actions/hour · {recoveryConfig.maxActionsPerIncident} per incident · {recoveryConfig.maxActionsPerServicePerHour} per service/hour · Cooldown: {Math.round(recoveryConfig.cooldownMs / 1000)}s · Verification: {recoveryConfig.verificationDelayMs / 1000}s / {recoveryConfig.verificationSamples} samples · Replicas: {recoveryConfig.minServiceReplicas}–{recoveryConfig.maxServiceReplicas}
-            <div className="muted" style={{ marginTop: '0.35rem' }}>Manual intervention after {recoveryConfig.maxFailuresBeforeManual} failed recovery attempts.</div>
+            Limit: {recoveryConfig.maxActionsPerHour} actions/hour · Verification delay: {recoveryConfig.verificationDelayMs} ms · Replicas: {recoveryConfig.minServiceReplicas}–{recoveryConfig.maxServiceReplicas}
           </div>
         </div>
 
         <div className="panel">
           <div className="panel-header">
             <h2 style={{ margin: 0 }}>Simulation controls</h2>
-            <StatusBadge value={simulationStatus?.active ? 'active' : simulating ? 'running' : 'stopped'} />
-          </div>
-          <div className="control-row">
-            <label className="control-field">Duration (ms)
-              <input type="number" min="1000" max="60000" step="1000" value={simulationDurationMs} onChange={(event) => setSimulationDurationMs(Number(event.target.value))} />
-            </label>
+            <StatusBadge value={simulating ? 'running' : 'ready'} />
           </div>
           <div className="button-row">
-            <button className="action-btn" onClick={() => triggerSimulation('/api/simulate/traffic-spike', { durationMs: simulationDurationMs })} disabled={simulating}>Traffic spike</button>
-            <button className="action-btn secondary" onClick={() => triggerSimulation('/api/simulate/database-overload', { durationMs: simulationDurationMs })} disabled={simulating}>Database overload</button>
-            <button className="action-btn secondary" onClick={() => triggerSimulation('/api/simulate/memory-leak', { durationMs: simulationDurationMs })} disabled={simulating}>Memory leak</button>
-            <button className="action-btn secondary" onClick={() => triggerSimulation('/api/simulate/cpu-overload', { durationMs: simulationDurationMs })} disabled={simulating}>CPU overload</button>
+            <button className="action-btn" onClick={() => triggerSimulation('/api/simulate/traffic-spike')} disabled={simulating}>Traffic spike</button>
+            <button className="action-btn secondary" onClick={() => triggerSimulation('/api/simulate/database-overload')} disabled={simulating}>Database overload</button>
+            <button className="action-btn secondary" onClick={() => triggerSimulation('/api/simulate/memory-leak')} disabled={simulating}>Memory leak</button>
+            <button className="action-btn secondary" onClick={() => triggerSimulation('/api/simulate/cpu-overload')} disabled={simulating}>CPU overload</button>
             <button className="action-btn secondary" onClick={() => triggerSimulation('/api/simulate/stop')} disabled={simulating}>Reset</button>
           </div>
-          <div className="detail-grid" style={{ marginTop: '0.9rem' }}>
-            {(simulationStatus?.services || []).flatMap((service) => (service.simulations || []).map((simulation) => (
-              <div className="detail-item" key={`${service.service}-${simulation.type}`}>
-                <strong>{service.service}: {simulation.type}</strong>
-                <div className="muted">{service.available === false ? 'Service unavailable' : `${simulation.active ? 'Active' : 'Stopped'} · duration ${simulation.durationMs || 0} ms · cleanup ${simulation.cleanupStatus || 'unknown'}${simulation.endsAt ? ` · ends ${new Date(simulation.endsAt).toLocaleTimeString()}` : ''}`}</div>
-              </div>
-            )))}
-          </div>
         </div>
-
         <div className="panel">
           <div className="panel-header">
             <h2 style={{ margin: 0 }}>Load Generator</h2>
@@ -756,25 +519,6 @@ function App() {
           </div>
           <div className="muted" style={{ marginBottom: '0.8rem' }}>
             Target: {loadStatus?.targetService || 'none'} · Scenario: {loadStatus?.scenario || 'none'}
-          </div>
-          <div className="control-row">
-            <label className="control-field">Target service
-              <select value={loadForm.targetService} onChange={(event) => setLoadForm((current) => ({ ...current, targetService: event.target.value }))}>
-                {[...businessServices, 'all'].map((service) => <option key={service} value={service}>{service}</option>)}
-              </select>
-            </label>
-            <label className="control-field">Requests per second
-              <input type="number" min="1" max="200" value={loadForm.requestsPerSecond} onChange={(event) => setLoadForm((current) => ({ ...current, requestsPerSecond: event.target.value }))} />
-            </label>
-            <label className="control-field">Duration (seconds)
-              <input type="number" min="1" max="300" value={loadForm.durationSeconds} onChange={(event) => setLoadForm((current) => ({ ...current, durationSeconds: event.target.value }))} />
-            </label>
-            <label className="control-field">Scenario
-              <select value={loadForm.scenario} onChange={(event) => setLoadForm((current) => ({ ...current, scenario: event.target.value }))}>
-                <option value="normal">normal</option>
-                <option value="traffic-spike">traffic-spike</option>
-              </select>
-            </label>
           </div>
           <div className="load-grid">
             <div className="load-stat">Requests/sec<strong>{loadStatus?.requestsPerSecond || 0}</strong></div>
@@ -824,14 +568,17 @@ function App() {
               })}
             </div>
           </div>
-
           <div className="panel">
             <div className="panel-header">
               <h2 style={{ margin: 0 }}>Dependency map</h2>
             </div>
             <div className="dependency-list" aria-label="Service dependency chain">
-                {dependencyGraph.nodes.map((node) => {
-                  const nodeStatus = dependencyStatus(node);
+              {dependencyGraph.nodes.map((node, index) => {
+                const nextNode = dependencyGraph.nodes[index + 1];
+                const hasNextEdge = dependencyGraph.edges.some(
+                  (edge) => edge.source === node && edge.target === nextNode
+                );
+
                 return (
                   <div key={node}>
                     <button
@@ -840,13 +587,14 @@ function App() {
                       aria-pressed={selectedDependency === node}
                       onClick={() => {
                         setSelectedDependency(node);
-                        if (businessServices.includes(node)) {
+                        if (['user-service', 'order-service', 'payment-service'].includes(node)) {
                           setSelectedService(node);
                         }
                       }}
                     >
-                      {node}<span className="node-state" style={{ background: dependencyColors[nodeStatus] }} title={nodeStatus} />
+                      {node}
                     </button>
+                    {hasNextEdge && <div className="dependency-arrow" aria-hidden="true">↓</div>}
                   </div>
                 );
               })}
@@ -855,11 +603,15 @@ function App() {
               <div><strong>{selectedDependency}</strong></div>
               <div>Depends on: {selectedDependencies.length ? selectedDependencies.join(', ') : 'none'}</div>
               <div>Depended on by: {selectedDependents.length ? selectedDependents.join(', ') : 'none'}</div>
-              <div style={{ marginTop: '0.35rem' }}>Status: {dependencyStatus(selectedDependency)}. Selecting a business service updates its metrics chart.</div>
+              {selectedDependency !== 'database' && <div style={{ marginTop: '0.35rem' }}>Selecting a service also updates its metrics chart.</div>}
               </div>
             </div>
           </div>
+          </div>
+        )}
 
+        {activeTab === 'analytics' && (
+          <div className="tab-content">
         <div className="panel">
           <div className="panel-header">
             <h2 style={{ margin: 0 }}>{selectedService} resilience trend</h2>
@@ -868,18 +620,17 @@ function App() {
           <div style={{ width: '100%', height: 280 }}>
             <ResponsiveContainer>
               <LineChart data={chartData}>
-                <CartesianGrid stroke="#e2e8f0" strokeDasharray="5 5" />
+                <CartesianGrid stroke="rgba(148, 163, 184, 0.14)" strokeDasharray="5 5" />
                 <XAxis dataKey="time" minTickGap={25} />
                 <YAxis />
                 <Tooltip />
                 <Legend />
-                <Line type="monotone" dataKey="latency" stroke="#ef4444" strokeWidth={2} name="Latency (ms)" />
-                <Line type="monotone" dataKey="probeFailed" stroke="#f59e0b" strokeWidth={2} name="Probe failure (1/0)" />
+                <Line type="monotone" dataKey="latency" stroke="#60a5fa" strokeWidth={2.5} dot={false} name="Latency (ms)" />
+                <Line type="monotone" dataKey="probeFailed" stroke="#c084fc" strokeWidth={2} dot={false} name="Probe failure (1/0)" />
               </LineChart>
             </ResponsiveContainer>
           </div>
         </div>
-
         <div className="panel">
           <div className="panel-header">
             <h2 style={{ margin: 0 }}>Memory usage</h2>
@@ -889,20 +640,24 @@ function App() {
               <AreaChart data={chartData}>
                 <defs>
                   <linearGradient id="cpuFill" x1="0" x2="0" y1="0" y2="1">
-                    <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8} />
-                    <stop offset="95%" stopColor="#3b82f6" stopOpacity={0.1} />
+                    <stop offset="5%" stopColor="#5eead4" stopOpacity={0.8} />
+                    <stop offset="95%" stopColor="#5eead4" stopOpacity={0.1} />
                   </linearGradient>
                 </defs>
-                <CartesianGrid stroke="#e2e8f0" strokeDasharray="5 5" />
+                <CartesianGrid stroke="rgba(148, 163, 184, 0.14)" strokeDasharray="5 5" />
                 <XAxis dataKey="time" minTickGap={25} />
                 <YAxis />
                 <Tooltip />
-                <Area type="monotone" dataKey="memory" stroke="#3b82f6" fill="url(#cpuFill)" name="Memory usage (%)" />
+                <Area type="monotone" dataKey="memory" stroke="#5eead4" fill="url(#cpuFill)" name="Memory usage (%)" />
               </AreaChart>
             </ResponsiveContainer>
           </div>
         </div>
+          </div>
+        )}
 
+        {activeTab === 'incidents' && (
+          <div className="tab-content">
         <div className="panel">
           <div className="panel-header">
             <h2 style={{ margin: 0 }}>Incident timeline</h2>
@@ -925,13 +680,12 @@ function App() {
                 <th>Created</th>
                 <th>Recovery</th>
                 <th>Action</th>
-                <th>Details</th>
               </tr>
             </thead>
             <tbody>
               {incidents.length === 0 ? (
                 <tr>
-                  <td colSpan="12" className="muted">No incidents recorded yet.</td>
+                  <td colSpan="11" className="muted">No incidents recorded yet.</td>
                 </tr>
               ) : (
                 incidents.slice(0, 8).map((incident) => (
@@ -945,21 +699,9 @@ function App() {
                     <td>{Array.isArray(incident.detected_by) ? incident.detected_by.join(', ') : 'unknown'}</td>
                     <td>{Array.isArray(incident.contributing_features) ? incident.contributing_features.join(', ') : 'unknown'}</td>
                     <td>{incident.created_at ? new Date(incident.created_at).toLocaleString() : 'unknown'}</td>
-                    <td><StatusBadge value={incident.recovery_status || incident.recoveryStatus || 'pending'} /></td>
+                    <td>{incident.recovery_status || incident.recoveryStatus || 'pending'}</td>
                     <td>
-                      {incident.action_status === 'requires_database_remediation' && (
-                        <span className="muted">Database remediation required</span>
-                      )}
-                      {incident.manual_intervention_required && (
-                        <span className="muted">Manual intervention required</span>
-                      )}
-                      {!incident.manual_intervention_required
-                        && incident.action_status !== 'requires_database_remediation'
-                        && !hasSafeRecoveryAction(incident)
-                        && <span className="muted">No safe action / manual review</span>}
-                      {!incident.manual_intervention_required
-                        && hasSafeRecoveryAction(incident)
-                        && ['pending', 'open', 'partially_recovered', 'not_recovered', 'expired'].includes(incident.recovery_status) && (
+                      {['pending', 'open', 'in_progress', 'partially_recovered'].includes(incident.recovery_status) && (
                         <button
                           className="action-btn secondary"
                           disabled={recoveringIncidentId === incident.id}
@@ -969,15 +711,6 @@ function App() {
                         </button>
                       )}
                     </td>
-                    <td>
-                      <button
-                        className="action-btn secondary"
-                        disabled={loadingIncidentDetail}
-                        onClick={() => openIncidentDetail(incident.id)}
-                      >
-                        {loadingIncidentDetail ? 'Loading...' : 'View details'}
-                      </button>
-                    </td>
                   </tr>
                 ))
               )}
@@ -985,80 +718,11 @@ function App() {
           </table>
           </div>
         </div>
-
-        {loadingIncidentDetail && <div className="panel" aria-live="polite">Loading incident details...</div>}
-        {incidentDetail && (
-          <section className="panel" aria-live="polite">
-            <div className="panel-header">
-              <div>
-                <h2 style={{ margin: 0 }}>Incident #{incidentDetail.id}</h2>
-                <span className="muted">{incidentDetail.service_name} · {incidentDetail.incident_type} · updated {incidentDetail.updated_at ? new Date(incidentDetail.updated_at).toLocaleString() : 'unknown'}</span>
-              </div>
-              <div className="button-row">
-                <button className="action-btn secondary" onClick={() => openIncidentDetail(incidentDetail.id)} disabled={loadingIncidentDetail}>Refresh</button>
-                <button className="action-btn secondary" onClick={() => setIncidentDetail(null)}>Close</button>
-              </div>
-            </div>
-            <div className="detail-grid">
-              <div className="detail-item"><strong>Status</strong><div><StatusBadge value={incidentDetail.recovery_status || 'pending'} /></div></div>
-              <div className="detail-item"><strong>Risk level</strong><div>{incidentDetail.risk_level || 'unknown'}</div></div>
-              <div className="detail-item"><strong>Anomaly score</strong><div>{formatNumber(incidentDetail.anomaly_score, 3)}</div></div>
-              <div className="detail-item"><strong>Failure probability</strong><div>{formatNumber(incidentDetail.failure_probability, 3)}</div></div>
-              <div className="detail-item"><strong>Classification</strong><div>{incidentDetail.incident_type || 'unknown'}</div></div>
-              <div className="detail-item"><strong>Root cause</strong><div>{incidentDetail.root_cause || 'unknown'}</div></div>
-              <div className="detail-item"><strong>Created</strong><div>{incidentDetail.created_at ? new Date(incidentDetail.created_at).toLocaleString() : 'unknown'}</div></div>
-              <div className="detail-item"><strong>Recovery recommendation</strong><div>{incidentDetail.recoveryRecommendation?.recommendation || incidentDetail.recovery_recommendation || 'manual_intervention_required'}</div><div className="muted">{incidentDetail.recoveryRecommendation?.reason || ''}</div></div>
-            </div>
-            <h3>Incident evidence</h3>
-            <div className="muted">{Array.isArray(incidentDetail.evidence) ? incidentDetail.evidence.map((entry, index) => <div key={index}>{typeof entry === 'string' ? entry : JSON.stringify(entry)}</div>) : JSON.stringify(incidentDetail.evidence || {})}</div>
-            <div className="panel-header" style={{ marginTop: '1rem' }}>
-              <h3 style={{ margin: 0 }}>Incident report · {incidentDetail.summary?.source === 'genai' ? 'GenAI' : 'local fallback'}</h3>
-              <StatusBadge value={incidentDetail.summary?.recoveryResult?.status || incidentDetail.recovery_status || 'pending'} />
-            </div>
-            {incidentDetail.summary?.report
-              ? Object.entries(incidentDetail.summary.report).map(([field, value]) => (
-                <div className="detail-item" key={field} style={{ marginBottom: '0.5rem' }}>
-                  <strong>{field.replace(/([A-Z])/g, ' $1')}</strong>
-                  {Array.isArray(value) ? <ul>{value.map((entry, index) => <li key={index}>{entry}</li>)}</ul> : <div>{value}</div>}
-                </div>
-              ))
-              : <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{incidentDetail.summary?.summary || 'Summary is not available yet.'}</pre>}
-            <div className="button-row" style={{ marginTop: '0.75rem' }}>
-              <button
-                className="action-btn"
-                disabled={Boolean(incidentDetail.manual_intervention_required)
-                  || incidentDetail.recoveryRecommendation?.recommendation === 'database_remediation_required'
-                  || !hasSafeRecoveryAction(incidentDetail)
-                  || recoveringIncidentId === incidentDetail.id}
-                onClick={() => recoverIncident(incidentDetail.id)}
-              >
-                {recoveringIncidentId === incidentDetail.id ? 'Recovering...' : 'Run manual recovery'}
-              </button>
-              {incidentDetail.manual_intervention_required && <span className="muted">Automated recovery is blocked; operator attention is required.</span>}
-              {incidentDetail.recoveryRecommendation?.recommendation === 'database_remediation_required' && <span className="muted">Database incidents require database-level remediation.</span>}
-              {!hasSafeRecoveryAction(incidentDetail) && incidentDetail.recoveryRecommendation?.recommendation !== 'database_remediation_required' && <span className="muted">No safe automated action is defined for this incident type.</span>}
-            </div>
-            <h3>Recovery timeline</h3>
-            {incidentDetail.timeline?.length
-              ? incidentDetail.timeline.map((entry) => (
-                <div className="timeline-item" key={entry.id}>
-                  <strong>{entry.action || entry.actionType || 'Recovery decision'} on {entry.targetService || 'unknown target'}</strong>
-                  <div className="button-row" style={{ marginTop: '0.4rem' }}>
-                    <StatusBadge value={entry.status || 'unknown'} />
-                    <StatusBadge value={entry.recoveryStatus || 'unknown'} />
-                  </div>
-                  <div className="muted" style={{ marginTop: '0.4rem' }}>{formatTimestamp(entry.timestamp)} · {lifecycleLabel(entry.triggeredBy || 'unknown')}</div>
-                  {hasValue(entry.reason) && <div style={{ marginTop: '0.4rem' }}>{entry.reason}</div>}
-                  <details style={{ marginTop: '0.5rem' }}>
-                    <summary>Full recovery audit details</summary>
-                    <AuditDetails record={entry} />
-                  </details>
-                </div>
-              ))
-              : <div className="muted">No recovery action has been recorded for this incident.</div>}
-          </section>
+          </div>
         )}
 
+        {activeTab === 'recovery' && (
+          <div className="tab-content">
         <div className="panel">
           <div className="panel-header">
             <h2 style={{ margin: 0 }}>Recovery activity</h2>
@@ -1067,69 +731,42 @@ function App() {
             <table>
               <thead>
                 <tr>
-                  <th>Timestamp</th>
-                  <th>Incident ID</th>
-                  <th>Action</th>
-                  <th>Target service</th>
-                  <th>Replica change</th>
-                  <th>Action / recovery status</th>
+                  <th>Incident</th>
+                  <th>Action / target</th>
+                  <th>Replicas</th>
+                  <th>Action status</th>
+                  <th>Recovery status</th>
+                  <th>Before → after</th>
                   <th>Effectiveness</th>
                   <th>Triggered by</th>
+                  <th>Timestamp</th>
                 </tr>
               </thead>
               <tbody>
                 {recoveryActions.length === 0 ? (
-                  <tr><td colSpan="8" className="muted">No recovery actions recorded.</td></tr>
+                  <tr><td colSpan="9" className="muted">No recovery actions recorded.</td></tr>
                 ) : recoveryActions.slice(0, 10).map((action) => (
-                  <Fragment key={action.id}>
-                  <tr>
-                      <td>
-                        <button
-                          type="button"
-                          className="expand-action"
-                          aria-expanded={expandedRecoveryActionId === action.id}
-                          aria-controls={`recovery-audit-${action.id}`}
-                          aria-label={`${expandedRecoveryActionId === action.id ? 'Collapse' : 'Expand'} audit details for recovery action ${action.id}`}
-                          onClick={() => setExpandedRecoveryActionId((current) => current === action.id ? null : action.id)}
-                        >
-                          {formatTimestamp(action.created_at || action.timestamp)}
-                          <span className="muted"> {expandedRecoveryActionId === action.id ? '−' : '+'}</span>
-                        </button>
-                      </td>
-                      <td>{action.incident_id ?? action.incidentId ?? '—'}</td>
-                      <td>{action.action_type || action.actionType || action.action || '—'}</td>
-                      <td>{action.target_service || action.targetService || '—'}</td>
-                      <td>
-                        {action.previous_replicas != null || action.new_replicas != null
-                          ? `${action.previous_replicas ?? '—'} → ${action.new_replicas ?? '—'}`
-                          : '—'}
-                      </td>
-                      <td>
-                        <div className="button-row">
-                          <StatusBadge value={action.status || 'unknown'} />
-                          {action.recovery_status || action.recoveryStatus
-                            ? <StatusBadge value={action.recovery_status || action.recoveryStatus} />
-                            : <span className="muted">Recovery: —</span>}
-                        </div>
-                      </td>
-                      <td>{action.effectiveness_score != null && Number.isFinite(Number(action.effectiveness_score))
-                        ? `${formatNumber(action.effectiveness_score, 1)}%`
-                        : '—'}</td>
-                      <td>{action.triggered_by || action.triggeredBy || '—'}</td>
-                    </tr>
-                    {expandedRecoveryActionId === action.id && (
-                      <tr className="recovery-detail-row">
-                        <td colSpan="8" id={`recovery-audit-${action.id}`}>
-                          <AuditDetails record={action} />
-                        </td>
-                      </tr>
-                    )}
-                  </Fragment>
+                  <tr key={action.id}>
+                    <td>{action.incident_id}</td>
+                    <td>{action.action_type} / {action.target_service}</td>
+                    <td>{action.previous_replicas ?? '-'} → {action.new_replicas ?? '-'}</td>
+                    <td>{action.status}</td>
+                    <td>{action.recovery_status || 'pending'}</td>
+                    <td>
+                      CPU {formatNumber(action.before_metrics?.cpuUsage, 0)} → {formatNumber(action.after_metrics?.cpuUsage, 0)}%; memory {formatNumber(action.before_metrics?.memoryUsage, 0)} → {formatNumber(action.after_metrics?.memoryUsage, 0)}%; latency {formatNumber(action.before_metrics?.latencyMs, 0)} → {formatNumber(action.after_metrics?.latencyMs, 0)} ms; error {formatNumber(action.before_metrics?.errorRate, 1)} → {formatNumber(action.after_metrics?.errorRate, 1)}%
+                    </td>
+                    <td>{action.effectiveness_score === null ? '-' : `${formatNumber(action.effectiveness_score, 1)}%`}</td>
+                    <td>{action.triggered_by || 'manual'}</td>
+                    <td>{action.created_at ? new Date(action.created_at).toLocaleString() : '-'}</td>
+                  </tr>
                 ))}
               </tbody>
             </table>
           </div>
         </div>
+          </div>
+        )}
+        </main>
       </div>
     </>
   );
