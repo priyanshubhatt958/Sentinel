@@ -1,162 +1,166 @@
-# AI-Powered Self-Healing Cloud Application
+# Sentinel: AI-Powered Cloud Self-Healing System
 
-This project is a production-style B.Tech final-year major project that demonstrates an AI-powered self-healing cloud application using anomaly detection, root-cause analysis, recovery orchestration, and a React dashboard.
+Sentinel is a local Docker Compose application that collects real container and HTTP-service telemetry, sends it through an ML-assisted anomaly pipeline, persists incidents and recovery actions in PostgreSQL, and presents the result in a React dashboard.
 
-## Project Overview
+## Objectives
 
-The system monitors Dockerized microservices, collects runtime metrics, detects anomalies, identifies probable root causes using a dependency graph, predicts failure risk, recommends safe recovery actions, and verifies improvements. It also generates a human-readable incident summary using an OpenAI-compatible API when available, with a deterministic fallback when no API key is configured.
+- Monitor payment, order, and user services plus PostgreSQL, the load generator, ML service, and monitoring backend.
+- Detect anomalies, classify incidents, estimate heuristic failure risk, and identify likely root causes.
+- Run bounded fault simulations and real HTTP traffic.
+- Recommend and optionally execute allowlisted recovery actions, then verify them against fresh measurements.
+- Persist application data, monitoring samples, incidents, recovery history, and structured summaries across service restarts.
 
-## Project Objective
-
-To build a self-healing distributed application that continuously observes microservices, identifies anomalies, diagnoses likely causes, applies safe recovery actions, and validates that the system recovered successfully.
-
-## High-Level Architecture
-
-```text
-React Dashboard
-      ↓
-Monitoring Backend
-      ↓
- ┌────────────┬───────────────┬────────────────┐
- ↓            ↓               ↓                ↓
-Metrics DB   ML Service   Dependency Graph   Recovery Engine
- └────────────┴───────────────┴────────────────┘
-      ↓
-Dockerized Microservices
-      ↓
-PostgreSQL Database
-```
-
-## Core Demo Scenario
-
-Normal system → simulated traffic spike → anomaly detected → dependency graph analysis → root cause identified → failure risk predicted → Payment Service scaled from 2 to 3 replicas → recovery verified → GenAI summary generated.
-
-## Technologies
-
-- Node.js 20 + Express
-- Python 3.11 + FastAPI
-- PostgreSQL 16
-- Docker + Docker Compose
-- React + Vite + Recharts + Axios
-- scikit-learn + pandas + numpy + NetworkX
-- OpenAI-compatible GenAI API (optional)
-
-## Repository Structure
+## Architecture
 
 ```text
-cloud-self-healing-system/
-├── services/
-│   ├── order-service/
-│   ├── payment-service/
-│   └── user-service/
-├── load-generator/
-├── monitoring-backend/
-├── ml-service/
-├── frontend/
-├── docker-compose.yml
-├── .env.example
-├── .gitignore
-├── docs/
-├── README.md
-└── .dockerignore
+Browser (React/Vite :5173)
+          |
+Monitoring API (:5000) ---- ML API (:8000)
+    |       |       |
+    |       |       +-- Docker Engine API (local Docker socket)
+    |       +---------- Load generator (:8004)
+    +------------------ PostgreSQL (:5432)
+                              |
+                 user (:8003), order (:8001),
+                 payment gateway (:8002) -> payment replicas
 ```
 
-## Setup
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the monitoring, ML, incident, recovery, and GenAI data flows.
 
-1. Copy `.env.example` to `.env`.
-2. Update environment variables as required.
-3. Ensure Docker Desktop is running on Windows.
-4. Run:
+## Technology
+
+- Docker Compose and Docker Engine API
+- Node.js, Express, PostgreSQL, `pg`, and Dockerode
+- Python, FastAPI, scikit-learn, pandas, NetworkX, and joblib
+- React, Vite, and Recharts
+
+## Services and local ports
+
+| Service | Port | Purpose |
+|---|---:|---|
+| Frontend | 5173 | Live monitoring dashboard |
+| Monitoring backend | 5000 | Metrics, incident, recovery, and simulation APIs |
+| ML service | 8000 | Anomaly detection, classification, prediction, root cause |
+| Order service | 8001 | Persistent orders and payment orchestration |
+| Payment gateway | 8002 | Stable host port routed to Compose-scaled payment replicas |
+| Payment service | — | Persistent payments; internal Compose service |
+| User service | 8003 | Persistent users |
+| Load generator | 8004 | Bounded real HTTP traffic |
+| PostgreSQL | 5432 | Application and monitoring persistence |
+
+## Setup and run
+
+Run these commands from `cloud-self-healing-system` in PowerShell. Ensure Docker Desktop is running with its Linux engine enabled.
 
 ```powershell
-docker compose up --build
+Copy-Item .env.example .env
+docker compose config --quiet
+docker compose up --build -d
+docker compose ps
 ```
 
-## Verification
+The `.env` file is local configuration; do not commit it. The sample disables automatic recovery and GenAI by default.
+
+Stop the stack without deleting persistent PostgreSQL data:
 
 ```powershell
-curl http://localhost:8001/health
-curl http://localhost:8002/health
-curl http://localhost:8003/health
-curl http://localhost:5000/api/services/status
-curl http://localhost:5000/api/metrics/current
-curl "http://localhost:5000/api/metrics/history?service=payment-service&range=1h"
-curl http://localhost:5000/api/monitoring/health
+docker compose down
 ```
 
-## Real-Time Monitoring
+To delete the database volume as well, use `docker compose down -v` only when intentionally resetting all local data.
 
-The monitoring backend reads the Docker Engine API through the mounted Docker socket. It does not fabricate container health or resource values. Every five seconds it records:
-
-- Docker lifecycle state, container ID, uptime, restart count, and last container error
-- Docker health-check state, independent of lifecycle state
-- CPU percentage calculated from successive Docker CPU and system CPU counters, multiplied by the available CPU count
-- Memory used after subtracting Docker cache, memory limit, and usage percentage when a finite limit is available
-- Application health-probe latency, HTTP status, success/failure outcome, and probe error
-
-Historical samples are stored in PostgreSQL in the `monitoring_samples` table and retained for `MONITORING_RETENTION_DAYS` (default: 7). The dashboard polls the monitoring API every five seconds and shows a stale-data message when the backend is unavailable.
-
-Automatic recovery is disabled by default. When explicitly enabled, Sentinel executes only allowlisted restart or one-replica payment-service scale actions, enforces an hourly rate limit and per-incident cooldown, then verifies fresh metrics before generating a recovery summary. Manual recovery remains available while automatic recovery is disabled.
-
-## Real Load Generator
-
-The `load-generator` Compose service runs on port `8004` and creates real HTTP traffic inside the Compose network. It sends valid POST requests to `/orders`, `/payments`, and `/users`, then records request counts and measured latency from those requests.
-
-Start a 60-second payment traffic run at 50 requests per second:
+## Basic checks
 
 ```powershell
-$body = @{ targetService = 'payment-service'; requestsPerSecond = 50; durationSeconds = 60; scenario = 'traffic-spike' } | ConvertTo-Json
+curl.exe http://localhost:5000/api/health
+curl.exe http://localhost:8000/ml/health
+curl.exe http://localhost:8001/health
+curl.exe http://localhost:8002/health
+curl.exe http://localhost:8003/health
+curl.exe http://localhost:8004/health
+```
+
+The dashboard is at <http://localhost:5173>. `GET /api/metrics/current?service=payment-service` returns persisted real service, probe, and database-pool samples.
+
+## End-to-end demo
+
+Start a bounded run of real payment requests:
+
+```powershell
+$body = @{
+  targetService = 'payment-service'
+  requestsPerSecond = 100
+  durationSeconds = 60
+  scenario = 'traffic-spike'
+} | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri http://localhost:5000/api/load/start -ContentType 'application/json' -Body $body
-Invoke-RestMethod -Method Get -Uri http://localhost:5000/api/load/status
-Invoke-RestMethod -Method Post -Uri http://localhost:5000/api/load/stop
 ```
 
-The load generator limits runs to 200 requests per second and 300 seconds, prevents overlapping runs, continues when an individual request fails, and reports successful and failed requests separately. The existing `POST /api/simulate/traffic-spike` demo now starts this real payment load automatically in addition to the controlled service-metric scenario.
-
-## Automatic Incident Detection
-
-After each monitoring cycle, the backend sends the latest real Docker and probe sample to the ML service. Anomalies trigger prediction, classification, and dependency-aware root-cause analysis, then create or update a persisted incident. Active incidents are updated instead of duplicated, while new service/type incidents use a two-minute cooldown.
+Start the bounded traffic-delay simulation:
 
 ```powershell
-Invoke-RestMethod http://localhost:5000/api/incidents
+Invoke-RestMethod -Method Post -Uri http://localhost:5000/api/simulate/traffic-spike -ContentType 'application/json' -Body '{}'
+```
+
+After 10–20 seconds, inspect metrics and incidents:
+
+```powershell
+Invoke-RestMethod 'http://localhost:5000/api/metrics/current?service=payment-service'
 Invoke-RestMethod http://localhost:5000/api/incidents/active
-Invoke-RestMethod -Method Post -Uri http://localhost:5000/api/incidents/detect
+Invoke-RestMethod http://localhost:5000/api/simulations/status
 ```
 
-Automatic recovery is a separate opt-in stage, controlled by `AUTO_RECOVERY_ENABLED`; it remains off unless enabled through configuration. Manual recovery is still available through `POST /api/incidents/:id/recover`.
+Automatic recovery remains opt-in. Manual recovery is recorded as planned, executing, executed, verification-pending, and then a measured result. The verifier collects six fresh samples over a 30-second window by default, applies minimum improvement thresholds and weighted scoring, and retains all action details in the recovery timeline. Scaling runs through Docker Compose and the payment gateway keeps host port 8002 stable across replicas.
 
-## Safe Recovery
-
-Recovery settings are configured with these defaults in `.env.example`:
-
-```text
-AUTO_RECOVERY_ENABLED=false
-AUTO_RECOVERY_MAX_ACTIONS_PER_HOUR=5
-RECOVERY_VERIFICATION_DELAY_MS=10000
-MAX_SERVICE_REPLICAS=5
-MIN_SERVICE_REPLICAS=2
-```
-
-Read or update runtime configuration and action history:
+To enable automatic recovery temporarily for a controlled local demonstration:
 
 ```powershell
-Invoke-RestMethod http://localhost:5000/api/recovery/config
-Invoke-RestMethod -Method Post -Uri http://localhost:5000/api/recovery/config -ContentType 'application/json' -Body (@{ autoRecoveryEnabled = $true } | ConvertTo-Json)
-Invoke-RestMethod 'http://localhost:5000/api/recovery/actions?incidentId=1'
+$body = @{ autoRecoveryEnabled = $true } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:5000/api/recovery/config -ContentType 'application/json' -Body $body
 ```
 
-Automatic actions are limited to `restart_service` and `scale_service`, targeting payment, order, user, or load-generator containers. The implemented rules scale payment-service by one replica only (2→3 in the default Compose setup), never beyond five. Database bottlenecks do not restart or scale the database; the action record explains that database-level remediation is outside the safe scope. Recovery actions retain before/after metrics and verification results.
+Inspect the incident detail, timeline, and report at `GET /api/incidents/{id}`, `GET /api/incidents/{id}/recovery-timeline`, and `GET /api/incidents/{id}/summary`. Turn automatic recovery off again when finished. Manual recovery is available in the dashboard for incidents with a safe action; database incidents are explicitly skipped.
 
-## Demo Sequence
+More detailed commands and expected observations are in [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md).
+
+## Real functionality vs. simulations
+
+**Real:** Docker lifecycle/health/restart data, Docker CPU and memory counters, HTTP health-probe timing, service request counts and latencies, PostgreSQL operations and pool utilization, load-generator request outcomes, PostgreSQL persistence, ML pipeline calls, recovery action history, and fresh before/after measurements.
+
+**Bounded simulation:** traffic delay, database query delay/concurrency, temporary memory allocation, and worker-thread CPU load. These are explicit fault-injection controls, not naturally occurring production failures. Each simulation is duration-limited and reports cleanup state.
+
+**Model limits:** the Isolation Forest is trained on generated training samples during image build. Failure probability is a heuristic and not a calibrated time-to-failure estimate. GenAI is optional; when disabled or unavailable, Sentinel generates a local report from stored incident data.
+
+## Configuration
+
+Copy [`.env.example`](.env.example) to `.env`. Important settings include database pool limits, simulation bounds, recovery cooldown/action limits, `AUTO_RECOVERY_ENABLED`, and `GENAI_ENABLED`/`GENAI_API_KEY`. See [docs/API.md](docs/API.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Tests and docs
 
 ```powershell
-curl -X POST http://localhost:5000/api/simulate/traffic-spike
-curl http://localhost:5000/api/incidents
-curl http://localhost:5000/api/incidents/1
-curl -X POST http://localhost:5000/api/incidents/1/recover
-curl http://localhost:8002/metrics
+Set-Location monitoring-backend
+npm test
+Set-Location ..\load-generator
+npm test
+Set-Location ..\services\common
+node --test test\*.test.js
+Set-Location ..\..\ml-service
+python -m compileall app
+python -m unittest discover -s tests
+Set-Location ..\frontend
+npm run build
+Set-Location ..
+docker compose config --quiet
 ```
 
-## Notes
+The full test/verification ledger is in [docs/TESTING.md](docs/TESTING.md). Other project documentation:
 
-This starter scaffold is designed to be extended across the milestone implementation. Full app logic, ML detection, dependency analysis, and dashboard are added in the subsequent milestones.
+- [API reference](docs/API.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Demo script](docs/DEMO_SCRIPT.md)
+- [Final report](docs/FINAL_REPORT.md)
+- [Viva questions](docs/VIVA_QUESTIONS.md)
+
+## Limitations and future work
+
+Sentinel is a local demonstration, not a production control plane. Recovery is deliberately constrained, Docker socket access is powerful, GenAI output is not authoritative, and anomaly thresholds require workload-specific calibration. Future work includes calibrated prediction, stronger action approval/audit controls, metrics export, dashboard component tests, and controlled replica lifecycle management aligned with Compose.

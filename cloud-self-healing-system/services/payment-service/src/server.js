@@ -1,163 +1,99 @@
 const express = require('express');
-const dotenv = require('dotenv');
-const { Client } = require('pg');
-const { randomUUID } = require('crypto');
-
-dotenv.config();
+const { createServiceDatabase } = require('../common/database');
+const { createSimulationController, createTelemetry } = require('../common/telemetry');
+const logger = require('../common/logger');
 
 const app = express();
 const port = Number(process.env.PORT || 8002);
+const simulations = createSimulationController('payment-service');
+const telemetry = createTelemetry('payment-service', ['/payments']);
+const database = createServiceDatabase(simulations);
 
-const metrics = {
-  service: 'payment-service',
-  cpuUsage: 42,
-  memoryUsage: 55,
-  requestRate: 120,
-  latencyMs: 180,
-  errorRate: 0.4,
-  dbConnections: 35,
-  status: 'healthy',
-  failureMode: 'normal',
-  timestamp: new Date().toISOString()
-};
+app.use(express.json({ limit: '32kb' }));
+app.use(telemetry.middleware);
+app.use(simulations.middleware);
 
-function syncMetrics() {
-  metrics.timestamp = new Date().toISOString();
-  return { ...metrics, timestamp: metrics.timestamp };
-}
-
-function applyNormalVariation() {
-  if (metrics.failureMode === 'normal') {
-    metrics.cpuUsage = Math.max(25, Math.min(60, metrics.cpuUsage + (Math.random() - 0.5) * 8));
-    metrics.memoryUsage = Math.max(35, Math.min(70, metrics.memoryUsage + (Math.random() - 0.5) * 6));
-    metrics.requestRate = Math.max(80, Math.min(250, metrics.requestRate + (Math.random() - 0.5) * 40));
-    metrics.latencyMs = Math.max(90, Math.min(220, metrics.latencyMs + (Math.random() - 0.5) * 30));
-    metrics.errorRate = Math.max(0.1, Math.min(1.5, metrics.errorRate + (Math.random() - 0.5) * 0.5));
-    metrics.dbConnections = Math.max(10, Math.min(40, metrics.dbConnections + (Math.random() - 0.5) * 8));
-    metrics.status = 'healthy';
-  }
-}
-
-setInterval(() => {
-  applyNormalVariation();
-}, 3000);
-
-app.use(express.json());
-
-const dbClient = new Client({
-  host: process.env.DATABASE_HOST || 'database',
-  port: Number(process.env.DATABASE_PORT || 5432),
-  database: process.env.DATABASE_NAME || 'cloud_self_healing',
-  user: process.env.DATABASE_USER || 'cloud_user',
-  password: process.env.DATABASE_PASSWORD || 'cloud_password'
-});
-
-async function connectDb() {
+app.get('/health', async (req, res) => {
   try {
-    await dbClient.connect();
-    console.log('Payment Service connected to PostgreSQL');
+    await database.checkHealth();
+    res.json({ service: 'payment-service', status: 'healthy', timestamp: new Date().toISOString() });
   } catch (error) {
-    console.error('Database connection failed:', error.message);
+    res.status(503).json({ service: 'payment-service', status: 'unavailable', error: error.message });
   }
-}
-
-connectDb();
-
-app.get('/health', (req, res) => {
-  res.json({ service: 'payment-service', status: 'healthy', timestamp: new Date().toISOString() });
 });
 
 app.get('/metrics', (req, res) => {
-  res.json(syncMetrics());
+  res.json({ ...telemetry.snapshot(), ...database.snapshot(), simulations: simulations.getStatus() });
 });
 
-app.post('/simulate/traffic-spike', (req, res) => {
-  metrics.cpuUsage = 94;
-  metrics.memoryUsage = 68;
-  metrics.requestRate = 5000;
-  metrics.latencyMs = 2800;
-  metrics.errorRate = 8.2;
-  metrics.dbConnections = 95;
-  metrics.status = 'critical';
-  metrics.failureMode = 'traffic_spike';
-  res.json({ service: 'payment-service', status: 'simulated_traffic_spike', metrics: syncMetrics() });
-});
+app.get('/simulate/status', (req, res) => res.json(simulations.getStatus()));
 
-app.post('/simulate/database-overload', (req, res) => {
-  metrics.dbConnections = 98;
-  metrics.latencyMs = 2400;
-  metrics.errorRate = 7.5;
-  metrics.cpuUsage = 88;
-  metrics.status = 'critical';
-  metrics.failureMode = 'database_overload';
-  res.json({ service: 'payment-service', status: 'simulated_database_overload', metrics: syncMetrics() });
-});
-
-app.post('/simulate/memory-leak', (req, res) => {
-  metrics.memoryUsage = 92;
-  metrics.cpuUsage = 60;
-  metrics.latencyMs = 900;
-  metrics.status = 'warning';
-  metrics.failureMode = 'memory_leak';
-  res.json({ service: 'payment-service', status: 'simulated_memory_leak', metrics: syncMetrics() });
-});
-
-app.post('/simulate/cpu-overload', (req, res) => {
-  metrics.cpuUsage = 96;
-  metrics.latencyMs = 1900;
-  metrics.errorRate = 4.5;
-  metrics.status = 'warning';
-  metrics.failureMode = 'cpu_overload';
-  res.json({ service: 'payment-service', status: 'simulated_cpu_overload', metrics: syncMetrics() });
-});
+for (const type of ['traffic-spike', 'database-overload', 'memory-leak', 'cpu-overload']) {
+  app.post(`/simulate/${type}`, (req, res) => {
+    try {
+      const simulation = simulations.start(type, req.body?.durationMs);
+      if (type === 'database-overload') {
+        database.runDatabaseStress().catch((error) => logger.error('database_simulation_failed', { message: error.message }));
+      }
+      res.status(202).json({ success: true, simulation, status: simulations.getStatus() });
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ success: false, error: error.message, status: simulations.getStatus() });
+    }
+  });
+}
 
 app.post('/simulate/stop', (req, res) => {
-  metrics.cpuUsage = 42;
-  metrics.memoryUsage = 55;
-  metrics.requestRate = 120;
-  metrics.latencyMs = 180;
-  metrics.errorRate = 0.4;
-  metrics.dbConnections = 35;
-  metrics.status = 'healthy';
-  metrics.failureMode = 'normal';
-  res.json({ service: 'payment-service', status: 'reset_to_normal', metrics: syncMetrics() });
+  res.json({ success: true, status: simulations.stopAll() });
 });
-
-const payments = new Map();
 
 app.post('/payments', async (req, res) => {
-  const payment = {
-    id: randomUUID(),
-    ...req.body,
-    createdAt: new Date().toISOString()
-  };
-  payments.set(payment.id, payment);
-
-  try {
-    const result = await dbClient.query(
-      'INSERT INTO payments (id, amount, status, created_at) VALUES ($1, $2, $3, NOW())',
-      [payment.id, payment.amount || 0, payment.status || 'pending']
-    );
-    if (result) {
-      payment.dbInserted = true;
-    }
-  } catch (error) {
-    console.error('Insert payment failed:', error.message);
+  const amount = Number(req.body?.amount);
+  const rawOrderId = req.body?.orderId;
+  const orderId = rawOrderId === undefined || rawOrderId === null || rawOrderId === '' ? null : Number(rawOrderId);
+  if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: 'amount must be a non-negative number' });
+  if (orderId !== null && (!Number.isInteger(orderId) || orderId < 1)) {
+    return res.status(400).json({ error: 'orderId must be a positive integer when provided' });
   }
 
-  res.status(201).json(payment);
+  try {
+    const result = await database.query(
+      'INSERT INTO payments (order_id, amount, status) VALUES ($1, $2, $3) RETURNING id, order_id, amount, status, created_at',
+      [orderId, amount, req.body.status || 'pending']
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    res.locals.telemetryError = error.message;
+    logger.error('payment_persistence_failed', { message: error.message });
+    res.status(503).json({ error: 'Payment could not be persisted' });
+  }
 });
 
-app.get('/payments', (req, res) => {
-  res.json(Array.from(payments.values()));
+app.get('/payments', async (req, res) => {
+  try {
+    const result = await database.query('SELECT id, order_id, amount, status, created_at FROM payments ORDER BY created_at DESC LIMIT 500');
+    res.json(result.rows);
+  } catch (error) {
+    res.locals.telemetryError = error.message;
+    res.status(503).json({ error: 'Payments unavailable' });
+  }
 });
 
-app.get('/payments/:id', (req, res) => {
-  const payment = payments.get(req.params.id);
-  if (!payment) return res.status(404).json({ error: 'Payment not found' });
-  res.json(payment);
+app.get('/payments/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) return res.status(400).json({ error: 'Payment id must be a positive integer' });
+  try {
+    const result = await database.query(
+      'SELECT id, order_id, amount, status, created_at FROM payments WHERE id = $1',
+      [id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Payment not found' });
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.locals.telemetryError = error.message;
+    res.status(503).json({ error: 'Payment unavailable' });
+  }
 });
 
 app.listen(port, () => {
-  console.log(`Payment Service running on port ${port}`);
+  logger.info('payment_service_started', { port });
 });

@@ -1,130 +1,94 @@
 const express = require('express');
-const dotenv = require('dotenv');
-const { randomUUID } = require('crypto');
-
-dotenv.config();
+const { createServiceDatabase } = require('../common/database');
+const { createSimulationController, createTelemetry } = require('../common/telemetry');
+const logger = require('../common/logger');
 
 const app = express();
 const port = Number(process.env.PORT || 8003);
+const simulations = createSimulationController('user-service');
+const telemetry = createTelemetry('user-service', ['/users']);
+const database = createServiceDatabase(simulations);
 
-const metrics = {
-  service: 'user-service',
-  cpuUsage: 30,
-  memoryUsage: 40,
-  requestRate: 100,
-  latencyMs: 100,
-  errorRate: 0.1,
-  dbConnections: 8,
-  status: 'healthy',
-  failureMode: 'normal',
-  timestamp: new Date().toISOString()
-};
+app.use(express.json({ limit: '32kb' }));
+app.use(telemetry.middleware);
+app.use(simulations.middleware);
 
-function syncMetrics() {
-  metrics.timestamp = new Date().toISOString();
-  return { ...metrics, timestamp: metrics.timestamp };
-}
-
-function applyNormalVariation() {
-  if (metrics.failureMode === 'normal') {
-    metrics.cpuUsage = Math.max(20, Math.min(50, metrics.cpuUsage + (Math.random() - 0.5) * 6));
-    metrics.memoryUsage = Math.max(25, Math.min(55, metrics.memoryUsage + (Math.random() - 0.5) * 5));
-    metrics.requestRate = Math.max(60, Math.min(180, metrics.requestRate + (Math.random() - 0.5) * 25));
-    metrics.latencyMs = Math.max(70, Math.min(150, metrics.latencyMs + (Math.random() - 0.5) * 20));
-    metrics.errorRate = Math.max(0.05, Math.min(0.5, metrics.errorRate + (Math.random() - 0.5) * 0.2));
-    metrics.dbConnections = Math.max(5, Math.min(20, metrics.dbConnections + (Math.random() - 0.5) * 5));
-    metrics.status = 'healthy';
+app.get('/health', async (req, res) => {
+  try {
+    await database.checkHealth();
+    res.json({ service: 'user-service', status: 'healthy', timestamp: new Date().toISOString() });
+  } catch (error) {
+    res.status(503).json({ service: 'user-service', status: 'unavailable', error: error.message });
   }
-}
-
-setInterval(() => {
-  applyNormalVariation();
-}, 3000);
-
-app.use(express.json());
-
-app.get('/health', (req, res) => {
-  res.json({ service: 'user-service', status: 'healthy', timestamp: new Date().toISOString() });
 });
 
 app.get('/metrics', (req, res) => {
-  res.json(syncMetrics());
+  res.json({ ...telemetry.snapshot(), ...database.snapshot(), simulations: simulations.getStatus() });
 });
 
-app.post('/simulate/traffic-spike', (req, res) => {
-  metrics.cpuUsage = 74;
-  metrics.memoryUsage = 58;
-  metrics.requestRate = 2800;
-  metrics.latencyMs = 1200;
-  metrics.errorRate = 2.6;
-  metrics.dbConnections = 48;
-  metrics.status = 'warning';
-  metrics.failureMode = 'traffic_spike';
-  res.json({ service: 'user-service', status: 'simulated_traffic_spike', metrics: syncMetrics() });
-});
+app.get('/simulate/status', (req, res) => res.json(simulations.getStatus()));
 
-app.post('/simulate/database-overload', (req, res) => {
-  metrics.dbConnections = 90;
-  metrics.latencyMs = 1400;
-  metrics.errorRate = 4.2;
-  metrics.cpuUsage = 68;
-  metrics.status = 'warning';
-  metrics.failureMode = 'database_overload';
-  res.json({ service: 'user-service', status: 'simulated_database_overload', metrics: syncMetrics() });
-});
-
-app.post('/simulate/memory-leak', (req, res) => {
-  metrics.memoryUsage = 88;
-  metrics.cpuUsage = 54;
-  metrics.latencyMs = 700;
-  metrics.status = 'warning';
-  metrics.failureMode = 'memory_leak';
-  res.json({ service: 'user-service', status: 'simulated_memory_leak', metrics: syncMetrics() });
-});
-
-app.post('/simulate/cpu-overload', (req, res) => {
-  metrics.cpuUsage = 90;
-  metrics.latencyMs = 1500;
-  metrics.errorRate = 3.0;
-  metrics.status = 'warning';
-  metrics.failureMode = 'cpu_overload';
-  res.json({ service: 'user-service', status: 'simulated_cpu_overload', metrics: syncMetrics() });
-});
+for (const type of ['traffic-spike', 'database-overload', 'memory-leak', 'cpu-overload']) {
+  app.post(`/simulate/${type}`, (req, res) => {
+    try {
+      const simulation = simulations.start(type, req.body?.durationMs);
+      if (type === 'database-overload') {
+        database.runDatabaseStress().catch((error) => logger.error('database_simulation_failed', { message: error.message }));
+      }
+      res.status(202).json({ success: true, simulation, status: simulations.getStatus() });
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ success: false, error: error.message, status: simulations.getStatus() });
+    }
+  });
+}
 
 app.post('/simulate/stop', (req, res) => {
-  metrics.cpuUsage = 30;
-  metrics.memoryUsage = 40;
-  metrics.requestRate = 100;
-  metrics.latencyMs = 100;
-  metrics.errorRate = 0.1;
-  metrics.dbConnections = 8;
-  metrics.status = 'healthy';
-  metrics.failureMode = 'normal';
-  res.json({ service: 'user-service', status: 'reset_to_normal', metrics: syncMetrics() });
+  res.json({ success: true, status: simulations.stopAll() });
 });
 
-const users = new Map();
-
-app.post('/users', (req, res) => {
-  const user = {
-    id: randomUUID(),
-    ...req.body,
-    createdAt: new Date().toISOString()
-  };
-  users.set(user.id, user);
-  res.status(201).json(user);
+app.post('/users', async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  const email = String(req.body?.email || '').trim();
+  if (!name || !email) return res.status(400).json({ error: 'name and email are required' });
+  try {
+    const result = await database.query(
+      'INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, name, email, created_at',
+      [name, email]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    res.locals.telemetryError = error.message;
+    logger.error('user_persistence_failed', { message: error.message });
+    res.status(503).json({ error: 'User could not be persisted' });
+  }
 });
 
-app.get('/users', (req, res) => {
-  res.json(Array.from(users.values()));
+app.get('/users', async (req, res) => {
+  try {
+    const result = await database.query('SELECT id, name, email, created_at FROM users ORDER BY created_at DESC LIMIT 500');
+    res.json(result.rows);
+  } catch (error) {
+    res.locals.telemetryError = error.message;
+    res.status(503).json({ error: 'Users unavailable' });
+  }
 });
 
-app.get('/users/:id', (req, res) => {
-  const user = users.get(req.params.id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  res.json(user);
+app.get('/users/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) return res.status(400).json({ error: 'User id must be a positive integer' });
+  try {
+    const result = await database.query(
+      'SELECT id, name, email, created_at FROM users WHERE id = $1',
+      [id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'User not found' });
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.locals.telemetryError = error.message;
+    res.status(503).json({ error: 'User unavailable' });
+  }
 });
 
 app.listen(port, () => {
-  console.log(`User Service running on port ${port}`);
+  logger.info('user_service_started', { port });
 });

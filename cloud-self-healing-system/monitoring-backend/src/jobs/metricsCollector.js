@@ -1,6 +1,7 @@
 const axios = require('axios');
 const Docker = require('dockerode');
 const { client } = require('../config/db');
+const logger = require('../utils/logger');
 
 const docker = new Docker({ socketPath: process.env.DOCKER_SOCKET || '/var/run/docker.sock' });
 const POLL_INTERVAL_MS = Number(process.env.MONITORING_INTERVAL_MS || 5000);
@@ -10,11 +11,60 @@ const LOAD_GENERATOR_URL = process.env.LOAD_GENERATOR_URL || 'http://load-genera
 let lastCollectionAt = null;
 let lastCollectionError = null;
 const SERVICES = [
-  { name: 'payment-service', healthUrl: 'http://payment-service:8002/health' },
-  { name: 'order-service', healthUrl: 'http://order-service:8001/health' },
-  { name: 'user-service', healthUrl: 'http://user-service:8003/health' },
+  { name: 'payment-service', healthUrl: 'http://payment-service:8002/health', metricsPort: 8002 },
+  { name: 'order-service', healthUrl: 'http://order-service:8001/health', metricsPort: 8001 },
+  { name: 'user-service', healthUrl: 'http://user-service:8003/health', metricsPort: 8003 },
   { name: 'load-generator', healthUrl: `${LOAD_GENERATOR_URL}/health` }
 ];
+
+const SERVICE_METRIC_FIELDS = [
+  ['totalRequests', 'totalRequests'],
+  ['successfulRequests', 'successfulRequests'],
+  ['failedRequests', 'failedRequests'],
+  ['activeRequests', 'activeRequests'],
+  ['requestsLastMinute', 'requestsLastMinute'],
+  ['requestsPerSecond', 'requestsPerSecond'],
+  ['averageLatencyMs', 'averageLatencyMs'],
+  ['p95LatencyMs', 'p95LatencyMs'],
+  ['maxLatencyMs', 'maxLatencyMs'],
+  ['minLatencyMs', 'minLatencyMs'],
+  ['serviceErrorRate', 'errorRate'],
+  ['dbTotalQueries', 'totalDatabaseQueries'],
+  ['dbSuccessfulQueries', 'successfulDatabaseQueries'],
+  ['dbFailedQueries', 'failedDatabaseQueries'],
+  ['dbActiveConnections', 'activeDatabaseConnections'],
+  ['dbIdleConnections', 'idleDatabaseConnections'],
+  ['dbWaitingRequests', 'waitingDatabaseRequests'],
+  ['dbAverageQueryLatencyMs', 'averageDatabaseQueryLatencyMs'],
+  ['dbMaxQueryLatencyMs', 'maxDatabaseQueryLatencyMs'],
+  ['dbErrorRate', 'databaseErrorRate']
+];
+
+function serviceMetricValues(metrics) {
+  return Object.fromEntries(SERVICE_METRIC_FIELDS.map(([column, property]) => [
+    column,
+    metrics && metrics[property] !== undefined ? metrics[property] : null
+  ]));
+}
+
+function persistedServiceMetricValues(sample) {
+  return Object.fromEntries(SERVICE_METRIC_FIELDS.map(([column]) => [
+    column,
+    sample[column] !== undefined ? sample[column] : null
+  ]));
+}
+
+async function fetchContainerMetrics(service, inspect) {
+  if (!service.metricsPort) return null;
+  const addresses = Object.values(inspect.NetworkSettings?.Networks || {})
+    .map((network) => network.IPAddress)
+    .filter(Boolean);
+  const metricsUrl = addresses.length
+    ? `http://${addresses[0]}:${service.metricsPort}/metrics`
+    : service.healthUrl.replace(/\/health$/, '/metrics');
+  const response = await axios.get(metricsUrl, { timeout: PROBE_TIMEOUT_MS });
+  return response.data;
+}
 
 function calculateCpuPercent(stats) {
   const cpuDelta = Number(stats.cpu_stats?.cpu_usage?.total_usage || 0) - Number(stats.precpu_stats?.cpu_usage?.total_usage || 0);
@@ -95,14 +145,38 @@ async function collectContainer(service, containerInfo, probe, loadMetrics = nul
   };
 
   if (!inspect.State?.Running) {
-    return { ...baseSample, cpuPercent: null, memoryUsedBytes: null, memoryLimitBytes: null, memoryPercent: null };
+    return {
+      ...baseSample,
+      ...serviceMetricValues(null),
+      cpuPercent: null,
+      memoryUsedBytes: null,
+      memoryLimitBytes: null,
+      memoryPercent: null
+    };
+  }
+
+  let serviceMetrics = null;
+  if (service.metricsPort) {
+    try {
+      serviceMetrics = await fetchContainerMetrics(service, inspect);
+    } catch (error) {
+      lastCollectionError = `Service metrics unavailable for ${service.name}: ${error.message}`;
+    }
   }
 
   let stats;
   try {
     stats = await inspectState(container);
   } catch (error) {
-    return { ...baseSample, cpuPercent: null, memoryUsedBytes: null, memoryLimitBytes: null, memoryPercent: null, lastError: error.message };
+    return {
+      ...baseSample,
+      ...serviceMetricValues(serviceMetrics),
+      cpuPercent: null,
+      memoryUsedBytes: null,
+      memoryLimitBytes: null,
+      memoryPercent: null,
+      lastError: error.message
+    };
   }
 
   const memory = calculateMemory(stats);
@@ -112,6 +186,7 @@ async function collectContainer(service, containerInfo, probe, loadMetrics = nul
     memoryUsedBytes: memory.used,
     memoryLimitBytes: memory.limit,
     memoryPercent: memory.percent,
+    ...serviceMetricValues(serviceMetrics),
     probe,
     loadMetrics
   };
@@ -126,16 +201,28 @@ async function listServiceContainers(serviceName) {
 }
 
 async function insertMonitoringSample(sample) {
+  const metricFields = persistedServiceMetricValues(sample);
   await client.query(
     `INSERT INTO monitoring_samples
       (service_name, container_id, container_name, lifecycle_state, health_status, uptime_seconds, restart_count, last_error,
-       cpu_percent, memory_used_bytes, memory_limit_bytes, memory_percent, probe_latency_ms, probe_status_code, probe_ok, probe_error,
+       cpu_percent, memory_used_bytes, memory_limit_bytes, memory_percent,
+       total_requests, successful_requests, failed_requests, active_requests, requests_last_minute,
+       requests_per_second, average_latency_ms, p95_latency_ms, max_latency_ms, min_latency_ms, service_error_rate,
+       db_total_queries, db_successful_queries, db_failed_queries, db_active_connections, db_idle_connections,
+       db_waiting_requests, db_average_query_latency_ms, db_max_query_latency_ms, db_error_rate,
+       probe_latency_ms, probe_status_code, probe_ok, probe_error,
        load_active, load_target_service, load_scenario, load_requests_per_second, load_total_requests, load_successful_requests,
        load_failed_requests, load_current_requests_per_second, load_average_latency_ms, load_max_latency_ms, load_min_latency_ms, load_error_rate)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)`,
+    VALUES (${Array.from({ length: 48 }, (_, index) => `$${index + 1}`).join(', ')})`,
     [sample.serviceName, sample.containerId, sample.containerName, sample.lifecycleState, sample.healthStatus,
       sample.uptimeSeconds, sample.restartCount, sample.lastError, sample.cpuPercent, sample.memoryUsedBytes,
-      sample.memoryLimitBytes, sample.memoryPercent, sample.probe.latencyMs, sample.probe.statusCode,
+      sample.memoryLimitBytes, sample.memoryPercent,
+      metricFields.totalRequests, metricFields.successfulRequests, metricFields.failedRequests, metricFields.activeRequests,
+      metricFields.requestsLastMinute, metricFields.requestsPerSecond, metricFields.averageLatencyMs, metricFields.p95LatencyMs, metricFields.maxLatencyMs,
+      metricFields.minLatencyMs, metricFields.serviceErrorRate, metricFields.dbTotalQueries, metricFields.dbSuccessfulQueries,
+      metricFields.dbFailedQueries, metricFields.dbActiveConnections, metricFields.dbIdleConnections, metricFields.dbWaitingRequests,
+      metricFields.dbAverageQueryLatencyMs, metricFields.dbMaxQueryLatencyMs, metricFields.dbErrorRate,
+      sample.probe.latencyMs, sample.probe.statusCode,
       sample.probe.ok, sample.probe.error, sample.loadMetrics?.active ?? null, sample.loadMetrics?.targetService ?? null,
       sample.loadMetrics?.scenario ?? null, sample.loadMetrics?.requestsPerSecond ?? null, sample.loadMetrics?.totalRequests ?? null,
       sample.loadMetrics?.successfulRequests ?? null, sample.loadMetrics?.failedRequests ?? null,
@@ -239,6 +326,7 @@ async function collectMetrics(onSample) {
         memoryUsedBytes: null,
         memoryLimitBytes: null,
         memoryPercent: null,
+        ...serviceMetricValues(null),
         probe,
         loadMetrics
       };
@@ -248,7 +336,7 @@ async function collectMetrics(onSample) {
       } catch (error) {
         lastCollectionError = `Database persistence failed: ${error.message}`;
       }
-      if (onSample) Promise.resolve(onSample(unavailable)).catch((error) => console.error(`Anomaly detection failed: ${error.message}`));
+      if (onSample) Promise.resolve(onSample(unavailable)).catch((error) => logger.error('anomaly_detection_failed', { message: error.message }));
       continue;
     }
     for (const container of containers) {
@@ -259,7 +347,7 @@ async function collectMetrics(onSample) {
       } catch (error) {
         lastCollectionError = `Database persistence failed: ${error.message}`;
       }
-      if (onSample) Promise.resolve(onSample(sample)).catch((error) => console.error(`Anomaly detection failed: ${error.message}`));
+      if (onSample) Promise.resolve(onSample(sample)).catch((error) => logger.error('anomaly_detection_failed', { message: error.message }));
     }
   }
   try {
@@ -299,6 +387,7 @@ async function collectServiceMetrics(serviceName) {
       memoryUsedBytes: null,
       memoryLimitBytes: null,
       memoryPercent: null,
+      ...serviceMetricValues(null),
       probe,
       loadMetrics
     }];
@@ -328,7 +417,7 @@ function startMetricsCollector(onSample, intervalMs = POLL_INTERVAL_MS) {
       await collectMetrics(onSample);
     } catch (error) {
       lastCollectionError = error.message;
-      console.error(`Monitoring collection failed: ${error.message}`);
+      logger.error('monitoring_collection_failed', { message: error.message });
     } finally {
       running = false;
     }
@@ -337,4 +426,14 @@ function startMetricsCollector(onSample, intervalMs = POLL_INTERVAL_MS) {
   return setInterval(poll, intervalMs);
 }
 
-module.exports = { startMetricsCollector, collectMetrics, collectServiceMetrics, calculateCpuPercent, calculateMemory, getServiceStatus, getCollectorHealth, SERVICES };
+module.exports = {
+  startMetricsCollector,
+  collectMetrics,
+  collectServiceMetrics,
+  calculateCpuPercent,
+  calculateMemory,
+  getServiceStatus,
+  getCollectorHealth,
+  persistedServiceMetricValues,
+  SERVICES
+};

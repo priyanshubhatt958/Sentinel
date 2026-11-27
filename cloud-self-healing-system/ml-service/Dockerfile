@@ -9,6 +9,8 @@ COPY app ./app
 COPY train_model.py ./train_model.py
 COPY models ./models
 RUN python train_model.py
+COPY tests ./tests
+RUN python -m unittest discover -s tests
 
 EXPOSE 8000
 

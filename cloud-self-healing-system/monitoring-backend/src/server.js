@@ -3,15 +3,20 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const axios = require('axios');
 
+dotenv.config();
+
 const { initDatabase, client } = require('./db/init');
 const { startMetricsCollector, getServiceStatus, getCollectorHealth, SERVICES } = require('./jobs/metricsCollector');
 const { detectForSample, detectAllCurrentIncidents } = require('./services/incidentDetector');
-const { detectRootCause } = require('./graph/dependencyGraph');
-const { getRecoveryConfig, updateRecoveryConfig } = require('./services/recoveryService');
-const { runRecovery } = require('./services/recoveryOrchestrator');
-const { buildIncidentSummary, buildTemplateSummary } = require('./services/genAiService');
-
-dotenv.config();
+const { getRecoveryConfig, updateRecoveryConfig, recommendRecovery } = require('./services/recoveryService');
+const { runRecovery, startRecoveryReconciliation } = require('./services/recoveryOrchestrator');
+const {
+  buildIncidentSummaryResult,
+  buildTemplateReport,
+  formatReport
+} = require('./services/genAiService');
+const { getMlIntegrationStatus } = require('./services/mlService');
+const logger = require('./utils/logger');
 
 const app = express();
 const port = Number(process.env.PORT || 5000);
@@ -61,6 +66,32 @@ async function queryCurrentMonitoring(service) {
   return result.rows;
 }
 
+async function queryRecoveryTimeline(incidentId) {
+  return client.query(
+    `SELECT ra.id, ra.incident_id AS "incidentId", ra.created_at AS timestamp,
+       ra.created_at AS "createdAt", ra.updated_at AS "updatedAt",
+       ra.action_type AS action, ra.action_type AS "actionType",
+       ra.target_service AS "targetService", ra.status, ra.recovery_status AS "recoveryStatus",
+       COALESCE(ra.decision_reason, ra.message) AS reason, incident.root_cause AS "rootCause",
+       ra.before_metrics AS "beforeMetrics", ra.after_metrics AS "afterMetrics",
+       ra.effectiveness_score AS "effectivenessScore", ra.effectiveness_by_metric AS "effectivenessByMetric",
+       ra.verification_samples AS "verificationSamples", ra.samples_used AS "samplesUsed",
+       ra.verification_window_ms AS "verificationWindowMs",
+       ra.safety_check AS "safetyCheck", ra.replica_limit AS "replicaLimit",
+       ra.execution_details AS "executionDetails", ra.execution_started_at AS "executionStartedAt",
+       ra.execution_completed_at AS "executionCompletedAt",
+       ra.verification_started_at AS "verificationStartedAt",
+       ra.verification_completed_at AS "verificationCompletedAt",
+       ra.cooldown_started_at AS "cooldownStartedAt", ra.cooldown_until AS "cooldownUntil",
+       ra.error_details AS "errorDetails", ra.triggered_by AS "triggeredBy",
+       ra.decision_confidence AS "decisionConfidence", ra.recommendation
+     FROM recovery_actions ra
+     JOIN incidents incident ON incident.id = ra.incident_id
+     WHERE ra.incident_id = $1 ORDER BY ra.created_at ASC`,
+    [incidentId]
+  );
+}
+
 async function insertMetricRecord(payload) {
   const serviceName = payload.service || 'unknown';
   await client.query(
@@ -80,90 +111,13 @@ async function insertMetricRecord(payload) {
   );
 }
 
-async function insertIncidentRecord(data) {
-  const result = await client.query(
-    `INSERT INTO incidents (service_name, incident_type, root_cause, affected_services, anomaly_score, failure_probability, risk_level, evidence, recommended_action, action_status, recovery_status, genai_summary)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-     RETURNING *`,
-    [
-      data.service,
-      data.incidentType,
-      data.rootCause,
-      data.affectedServices || [data.service],
-      Number(data.anomalyScore || 0),
-      Number(data.failureProbability || 0),
-      data.riskLevel || 'MEDIUM',
-      JSON.stringify(data.evidence || {}),
-      data.recommendedAction || 'scale_service',
-      data.actionStatus || 'planned',
-      data.recoveryStatus || 'pending',
-      data.genaiSummary || null
-    ]
-  );
-
-  return result.rows[0];
-}
-
-async function buildIncidentFromMetrics(serviceName, payload) {
-  const rootCauseInfo = detectRootCause(serviceName, payload);
-
-  return {
-    service: serviceName,
-    incidentType: payload.failureMode || 'traffic_spike',
-    rootCause: rootCauseInfo.rootCause,
-    affectedServices: rootCauseInfo.affectedServices,
-    anomalyScore: 0.91,
-    failureProbability: 0.86,
-    riskLevel: 'HIGH',
-    evidence: {
-      ...payload,
-      rootCauseEvidence: rootCauseInfo.evidence,
-      dependencyPath: rootCauseInfo.propagationPath
-    },
-    recommendedAction: 'manual_review',
-    actionStatus: 'planned',
-    recoveryStatus: 'pending'
-  };
-}
-
-async function createOrUpdateIncident(incidentData) {
-  const existing = await client.query(
-    `SELECT * FROM incidents WHERE service_name = $1 ORDER BY id DESC LIMIT 1`,
-    [incidentData.service]
-  );
-
-  if (existing.rows.length > 0) {
-    const row = existing.rows[0];
-    const updated = await client.query(
-      `UPDATE incidents SET incident_type = $1, root_cause = $2, affected_services = $3, anomaly_score = $4, failure_probability = $5, risk_level = $6, evidence = $7, recommended_action = $8, action_status = $9, recovery_status = $10, genai_summary = NULL, updated_at = NOW()
-       WHERE id = $11 RETURNING *`,
-      [
-        incidentData.incidentType,
-        incidentData.rootCause,
-        incidentData.affectedServices || [incidentData.service],
-        Number(incidentData.anomalyScore || 0),
-        Number(incidentData.failureProbability || 0),
-        incidentData.riskLevel || 'MEDIUM',
-        JSON.stringify(incidentData.evidence || {}),
-        incidentData.recommendedAction || 'scale_service',
-        incidentData.actionStatus || 'planned',
-        incidentData.recoveryStatus || 'pending',
-        row.id
-      ]
-    );
-    return updated.rows[0];
-  }
-
-  return insertIncidentRecord(incidentData);
-}
-
 app.post('/api/metrics', async (req, res) => {
   try {
     const metrics = req.body;
     await insertMetricRecord(metrics);
     res.json({ success: true, message: 'Metric stored successfully.' });
   } catch (error) {
-    console.error('Metric ingestion failed:', error.message);
+    logger.error('metric_ingestion_failed', { message: error.message });
     res.status(500).json({ error: 'Metric ingestion failed' });
   }
 });
@@ -199,13 +153,25 @@ app.get('/api/metrics/current', async (req, res) => {
   }
 });
 
-app.get('/api/monitoring/health', async (req, res) => {
+app.get(['/api/health', '/api/monitoring/health'], async (req, res) => {
   try {
     await client.query('SELECT 1');
     await getServiceStatus();
-    res.json({ status: 'healthy', ...getCollectorHealth(), timestamp: new Date().toISOString() });
+    const mlIntegration = getMlIntegrationStatus();
+    res.json({
+      status: mlIntegration.available === false ? 'degraded' : 'healthy',
+      ...getCollectorHealth(),
+      mlIntegration,
+      timestamp: new Date().toISOString()
+    });
   } catch (error) {
-    res.status(503).json({ status: 'unavailable', ...getCollectorHealth(), error: 'Monitoring dependencies unavailable', timestamp: new Date().toISOString() });
+    res.status(503).json({
+      status: 'unavailable',
+      ...getCollectorHealth(),
+      mlIntegration: getMlIntegrationStatus(),
+      error: 'Monitoring dependencies unavailable',
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
@@ -255,7 +221,10 @@ app.get('/api/incidents', async (req, res) => {
 
 app.get('/api/incidents/active', async (req, res) => {
   const result = await client.query(
-    `SELECT * FROM incidents WHERE recovery_status IN ('pending', 'open', 'in_progress', 'partially_recovered') ORDER BY created_at DESC`
+    `SELECT * FROM incidents WHERE recovery_status IN
+      ('pending', 'open', 'planned', 'executing', 'executed', 'verification_pending', 'in_progress',
+       'partially_recovered', 'not_recovered', 'blocked', 'skipped', 'manual_intervention_required')
+     ORDER BY created_at DESC`
   );
   res.json(result.rows);
 });
@@ -279,8 +248,17 @@ app.get('/api/recovery/actions', async (req, res) => {
       return res.status(400).json({ error: 'incidentId must be a positive integer' });
     }
     const result = incidentId
-      ? await client.query('SELECT * FROM recovery_actions WHERE incident_id = $1 ORDER BY created_at DESC', [Number(incidentId)])
-      : await client.query('SELECT * FROM recovery_actions ORDER BY created_at DESC LIMIT 100');
+      ? await client.query(
+        `SELECT recovery_actions.*, incidents.root_cause, incidents.incident_type
+         FROM recovery_actions JOIN incidents ON incidents.id = recovery_actions.incident_id
+         WHERE recovery_actions.incident_id = $1 ORDER BY recovery_actions.created_at DESC`,
+        [Number(incidentId)]
+      )
+      : await client.query(
+        `SELECT recovery_actions.*, incidents.root_cause, incidents.incident_type
+         FROM recovery_actions JOIN incidents ON incidents.id = recovery_actions.incident_id
+         ORDER BY recovery_actions.created_at DESC LIMIT 100`
+      );
     res.json(result.rows);
   } catch (error) {
     res.status(503).json({ error: 'Recovery action history unavailable' });
@@ -300,7 +278,7 @@ app.post('/api/incidents/detect', async (req, res) => {
     }
     res.json({ success: true, results, recoveries });
   } catch (error) {
-    console.error('Manual incident detection failed:', error.message);
+    logger.error('manual_incident_detection_failed', { message: error.message });
     res.status(503).json({ error: 'Incident detection unavailable' });
   }
 });
@@ -308,39 +286,150 @@ app.post('/api/incidents/detect', async (req, res) => {
 app.get('/api/incidents/:id', async (req, res) => {
   const result = await client.query(`SELECT * FROM incidents WHERE id = $1`, [req.params.id]);
   if (!result.rows[0]) return res.status(404).json({ error: 'Incident not found' });
-  res.json(result.rows[0]);
+  const incident = result.rows[0];
+  const history = await client.query(
+    `SELECT COUNT(*)::INTEGER AS failures FROM recovery_actions
+      WHERE incident_id = $1 AND status IN ('failed', 'not_recovered')`,
+    [incident.id]
+  );
+  const recommendation = recommendRecovery(incident, Number(history.rows[0]?.failures || 0));
+  res.json({ ...incident, recoveryRecommendation: recommendation });
+});
+
+app.get('/api/incidents/:id/recovery-timeline', async (req, res) => {
+  try {
+    const incidentResult = await client.query('SELECT id FROM incidents WHERE id = $1', [req.params.id]);
+    if (!incidentResult.rows[0]) return res.status(404).json({ error: 'Incident not found' });
+    const result = await queryRecoveryTimeline(incidentResult.rows[0].id);
+    res.json(result.rows);
+  } catch (error) {
+    logger.error('recovery_timeline_unavailable', { incidentId: req.params.id, message: error.message });
+    res.status(503).json({ error: 'Recovery timeline unavailable' });
+  }
 });
 
 app.get('/api/incidents/:id/summary', async (req, res) => {
-  const incidentResult = await client.query(`SELECT * FROM incidents WHERE id = $1`, [req.params.id]);
-  if (!incidentResult.rows[0]) return res.status(404).json({ error: 'Incident not found' });
+  try {
+    const incidentResult = await client.query('SELECT * FROM incidents WHERE id = $1', [req.params.id]);
+    if (!incidentResult.rows[0]) return res.status(404).json({ error: 'Incident not found' });
 
-  const incident = incidentResult.rows[0];
-  const verified = ['recovered', 'partially_recovered', 'not_recovered'].includes(incident.recovery_status);
-  const summary = incident.genai_summary || (verified
-    ? await buildIncidentSummary(incident)
-    : buildTemplateSummary({ service: incident.service_name, incidentType: incident.incident_type, rootCause: incident.root_cause, recoveryResult: { status: incident.recovery_status || 'pending' } }));
-  res.json({ id: req.params.id, summary });
+    const incident = incidentResult.rows[0];
+    const recoveryHistory = await queryRecoveryTimeline(incident.id);
+    const timeline = recoveryHistory.rows;
+    const recovery = timeline[timeline.length - 1] || null;
+    let summary = incident.genai_summary;
+    let source = incident.genai_summary_source || (summary ? 'unknown' : null);
+    let report = incident.genai_report;
+
+    if (!summary || !report) {
+      const verified = ['recovered', 'partially_recovered', 'not_recovered'].includes(incident.recovery_status);
+      const summaryInput = {
+        id: incident.id,
+        service: incident.service_name,
+        incidentType: incident.incident_type,
+        rootCause: incident.root_cause,
+        anomalyScore: incident.anomaly_score,
+        riskLevel: incident.risk_level,
+        failureProbability: incident.failure_probability,
+        affectedServices: incident.affected_services,
+        evidence: incident.evidence,
+        metrics: incident.latest_metrics,
+        timeline,
+        recoveryEffectiveness: recovery?.effectivenessScore,
+        recoveryAction: recovery ? { action: recovery.actionType, target: recovery.targetService } : null,
+        recoveryResult: recovery
+          ? {
+            status: recovery.recoveryStatus,
+            beforeMetrics: recovery.beforeMetrics,
+            afterMetrics: recovery.afterMetrics,
+            effectivenessScore: recovery.effectivenessScore,
+            recommendation: recovery.recommendation
+          }
+          : { status: incident.recovery_status || 'pending' }
+      };
+      const result = verified
+        ? await buildIncidentSummaryResult(summaryInput)
+        : (() => {
+          const fallbackReport = buildTemplateReport(summaryInput);
+          return {
+            summary: formatReport(fallbackReport),
+            source: 'fallback',
+            report: fallbackReport
+          };
+        })();
+      summary = result.summary;
+      source = result.source;
+      report = result.report;
+      await client.query(
+        'UPDATE incidents SET genai_summary = $1, genai_summary_source = $2, genai_report = $3, updated_at = NOW() WHERE id = $4',
+        [summary, source, report ? JSON.stringify(report) : null, incident.id]
+      );
+    }
+
+    res.json({
+      id: incident.id,
+      summary,
+      report,
+      source,
+      fallback: source === 'fallback',
+      rootCause: incident.root_cause,
+      evidence: incident.evidence,
+      recoveryAction: recovery ? { action: recovery.actionType, target: recovery.targetService } : null,
+      recoveryResult: recovery
+        ? {
+          status: recovery.recoveryStatus,
+          beforeMetrics: recovery.beforeMetrics,
+          afterMetrics: recovery.afterMetrics,
+          effectivenessScore: recovery.effectivenessScore,
+          recommendation: recovery.recommendation
+        }
+        : { status: incident.recovery_status || 'pending' },
+      remainingRisks: report?.remainingRisks || null,
+      recommendedNextSteps: report?.recommendedNextSteps || incident.recovery_recommendation || null,
+      timeline,
+      recoveryRecommendation: recommendRecovery(incident)
+    });
+  } catch (error) {
+    logger.error('incident_summary_unavailable', { incidentId: req.params.id, message: error.message });
+    res.status(503).json({ error: 'Incident summary unavailable' });
+  }
 });
 
 app.post('/api/incidents/:id/recover', async (req, res) => {
   try {
     const result = await runRecovery(req.params.id, 'manual');
     if (result.status === 'not_found') return res.status(404).json(result);
-    if (result.status === 'in_progress') return res.status(409).json(result);
-    if (result.status === 'no_safe_action') return res.status(422).json(result);
-    if (result.status === 'max_replicas_reached') return res.status(409).json(result);
+    if (['in_progress', 'blocked'].includes(result.status)) {
+      return res.status(409).json(result);
+    }
+    if (['skipped', 'manual_intervention_required'].includes(result.status)) return res.status(422).json(result);
     res.status(result.success ? 200 : 400).json(result);
   } catch (error) {
-    console.error('Recovery failed:', error.message);
+    logger.error('recovery_failed', { message: error.message });
     res.status(500).json({ error: 'Recovery failed', details: error.message });
   }
 });
 
 app.get('/api/dependency-graph', (req, res) => {
   res.json({
-    nodes: ['user-service', 'order-service', 'payment-service', 'database'],
+    nodes: [
+      'frontend',
+      'monitoring-backend',
+      'load-generator',
+      'user-service',
+      'order-service',
+      'payment-service',
+      'database',
+      'ml-service'
+    ],
     edges: [
+      { source: 'frontend', target: 'monitoring-backend' },
+      { source: 'monitoring-backend', target: 'load-generator' },
+      { source: 'monitoring-backend', target: 'ml-service' },
+      { source: 'monitoring-backend', target: 'database' },
+      { source: 'load-generator', target: 'user-service' },
+      { source: 'load-generator', target: 'order-service' },
+      { source: 'load-generator', target: 'payment-service' },
       { source: 'user-service', target: 'order-service' },
       { source: 'order-service', target: 'payment-service' },
       { source: 'payment-service', target: 'database' }
@@ -348,9 +437,31 @@ app.get('/api/dependency-graph', (req, res) => {
   });
 });
 
-async function simulateService(service, route) {
+app.get('/api/simulations/status', async (req, res) => {
+  const services = {
+    'payment-service': 'http://payment-service:8002',
+    'order-service': 'http://order-service:8001',
+    'user-service': 'http://user-service:8003'
+  };
+  const statuses = await Promise.all(Object.entries(services).map(async ([service, baseUrl]) => {
+    try {
+      const response = await axios.get(`${baseUrl}/simulate/status`, { timeout: 5000 });
+      return { service, available: true, ...response.data };
+    } catch (error) {
+      return {
+        service,
+        available: false,
+        error: error.response?.data?.error || error.message
+      };
+    }
+  }));
+  const active = statuses.some((service) => service.simulations?.some((simulation) => simulation.active));
+  res.json({ active, services: statuses, timestamp: new Date().toISOString() });
+});
+
+async function simulateService(service, route, payload = {}) {
   const baseUrl = service === 'payment-service' ? 'http://payment-service:8002' : service === 'order-service' ? 'http://order-service:8001' : 'http://user-service:8003';
-  const response = await axios.post(`${baseUrl}${route}`, {}, { timeout: 10000 });
+  const response = await axios.post(`${baseUrl}${route}`, payload, { timeout: 10000 });
   return response.data;
 }
 
@@ -358,7 +469,7 @@ async function startTrafficLoad() {
   try {
     const response = await axios.post(`${LOAD_GENERATOR_URL}/start`, {
       targetService: 'payment-service',
-      requestsPerSecond: 50,
+      requestsPerSecond: 120,
       durationSeconds: 60,
       scenario: 'traffic-spike'
     }, { timeout: 10000 });
@@ -369,73 +480,54 @@ async function startTrafficLoad() {
   }
 }
 
-async function maybeRunAutomaticRecovery(incident) {
-  if (!incident?.id || !getRecoveryConfig().autoRecoveryEnabled) return null;
-  return runRecovery(incident.id, 'automatic');
-}
-
 app.post('/api/simulate/traffic-spike', async (req, res) => {
   try {
     const [results, load] = await Promise.all([
       Promise.all([
-      simulateService('payment-service', '/simulate/traffic-spike'),
-      simulateService('order-service', '/simulate/traffic-spike'),
-      simulateService('user-service', '/simulate/traffic-spike')
+        simulateService('payment-service', '/simulate/traffic-spike', req.body),
+        simulateService('order-service', '/simulate/traffic-spike', req.body),
+        simulateService('user-service', '/simulate/traffic-spike', req.body)
       ]),
       startTrafficLoad()
     ]);
-
-    const paymentMetrics = results[0].metrics;
-    const incident = await buildIncidentFromMetrics('payment-service', paymentMetrics);
-    const saved = await createOrUpdateIncident(incident);
-    const recovery = await maybeRunAutomaticRecovery(saved);
-
-    res.json({ success: true, results, load, incident: saved, recovery });
+    res.json({ success: true, results, load, incidentTracking: 'metrics_collector_ml_pipeline' });
   } catch (error) {
-    console.error('Traffic spike simulation failed:', error);
-    res.status(500).json({ error: 'Traffic spike simulation failed' });
+    logger.error('traffic_spike_simulation_failed', { message: error.message });
+    res.status(error.response?.status || 503).json({ error: 'Traffic spike simulation failed', details: error.message });
   }
 });
 
 app.post('/api/simulate/database-overload', async (req, res) => {
   try {
     const results = await Promise.all([
-      simulateService('payment-service', '/simulate/database-overload'),
-      simulateService('order-service', '/simulate/database-overload'),
-      simulateService('user-service', '/simulate/database-overload')
+      simulateService('payment-service', '/simulate/database-overload', req.body),
+      simulateService('order-service', '/simulate/database-overload', req.body),
+      simulateService('user-service', '/simulate/database-overload', req.body)
     ]);
-    const incident = await buildIncidentFromMetrics('payment-service', results[0].metrics);
-    const saved = await createOrUpdateIncident(incident);
-    const recovery = await maybeRunAutomaticRecovery(saved);
-    res.json({ success: true, results, incident: saved, recovery });
+    res.json({ success: true, results, incidentTracking: 'metrics_collector_ml_pipeline' });
   } catch (error) {
-    res.status(500).json({ error: 'Database overload simulation failed' });
+    logger.error('database_overload_simulation_failed', { message: error.message });
+    res.status(error.response?.status || 503).json({ error: 'Database overload simulation failed', details: error.message });
   }
 });
 
 app.post('/api/simulate/memory-leak', async (req, res) => {
   try {
-    const payment = await simulateService('payment-service', '/simulate/memory-leak');
-    const incident = await buildIncidentFromMetrics('payment-service', payment.metrics);
-    incident.incidentType = 'memory_leak';
-    const saved = await createOrUpdateIncident(incident);
-    const recovery = await maybeRunAutomaticRecovery(saved);
-    res.json({ success: true, incident: saved, payment, recovery });
+    const payment = await simulateService('payment-service', '/simulate/memory-leak', req.body);
+    res.json({ success: true, payment, incidentTracking: 'metrics_collector_ml_pipeline' });
   } catch (error) {
-    res.status(500).json({ error: 'Memory leak simulation failed' });
+    logger.error('memory_leak_simulation_failed', { message: error.message });
+    res.status(error.response?.status || 503).json({ error: 'Memory leak simulation failed', details: error.message });
   }
 });
 
 app.post('/api/simulate/cpu-overload', async (req, res) => {
   try {
-    const payment = await simulateService('payment-service', '/simulate/cpu-overload');
-    const incident = await buildIncidentFromMetrics('payment-service', payment.metrics);
-    incident.incidentType = 'cpu_overload';
-    const saved = await createOrUpdateIncident(incident);
-    const recovery = await maybeRunAutomaticRecovery(saved);
-    res.json({ success: true, incident: saved, payment, recovery });
+    const payment = await simulateService('payment-service', '/simulate/cpu-overload', req.body);
+    res.json({ success: true, payment, incidentTracking: 'metrics_collector_ml_pipeline' });
   } catch (error) {
-    res.status(500).json({ error: 'CPU overload simulation failed' });
+    logger.error('cpu_overload_simulation_failed', { message: error.message });
+    res.status(error.response?.status || 503).json({ error: 'CPU overload simulation failed', details: error.message });
   }
 });
 
@@ -446,24 +538,27 @@ app.post('/api/simulate/stop', async (req, res) => {
       simulateService('order-service', '/simulate/stop'),
       simulateService('user-service', '/simulate/stop')
     ]);
-    res.json({ success: true, results });
+    const load = await axios.post(`${LOAD_GENERATOR_URL}/stop`, {}, { timeout: 10000 }).then((response) => response.data);
+    res.json({ success: true, results, load });
   } catch (error) {
-    res.status(500).json({ error: 'Stop simulation failed' });
+    logger.error('simulation_stop_failed', { message: error.message });
+    res.status(error.response?.status || 503).json({ error: 'Stop simulation failed', details: error.message });
   }
 });
 
 async function bootstrap() {
   await initDatabase();
+  startRecoveryReconciliation();
   startMetricsCollector(async (sample) => {
     const detection = await detectForSample(sample);
     if (getRecoveryConfig().autoRecoveryEnabled && detection.anomaly && detection.incident?.id) {
       const recovery = await runRecovery(detection.incident.id, 'automatic');
-      if (recovery.status === 'failed') console.error(`Automatic recovery failed for incident ${detection.incident.id}: ${recovery.message}`);
+      if (recovery.status === 'failed') logger.error('automatic_recovery_failed', { incidentId: detection.incident.id, message: recovery.message });
     }
   });
 
   app.listen(port, () => {
-    console.log(`Monitoring Backend running on port ${port}`);
+    logger.info('monitoring_backend_started', { port });
   });
 }
 

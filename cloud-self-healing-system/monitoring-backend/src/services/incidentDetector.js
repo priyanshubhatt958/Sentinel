@@ -11,7 +11,9 @@ function numberOrNull(value) {
 
 async function latestLoadMetrics() {
   const result = await client.query(
-    `SELECT * FROM monitoring_samples WHERE service_name = 'load-generator' ORDER BY collected_at DESC LIMIT 1`
+    `SELECT * FROM monitoring_samples
+     WHERE service_name = 'load-generator' AND collected_at >= NOW() - INTERVAL '30 seconds'
+     ORDER BY collected_at DESC LIMIT 1`
   );
   return result.rows[0] || null;
 }
@@ -29,15 +31,34 @@ async function buildRealMetrics(sample) {
   const load = await latestLoadMetrics();
   const loadTargetsService = load?.load_target_service === sample.service_name || load?.load_target_service === 'all';
   const probeFailures = await probeFailureCount(sample.service_name);
+  const requestsLastMinute = numberOrNull(sample.requests_last_minute);
+  const serviceRequestsPerSecond = numberOrNull(sample.requests_per_second);
+  const loadRequestsPerSecond = loadTargetsService ? numberOrNull(load.load_current_requests_per_second) : null;
+  const requestRate = loadRequestsPerSecond === null
+    ? serviceRequestsPerSecond ?? (requestsLastMinute === null ? null : Number((requestsLastMinute / 60).toFixed(2)))
+    : Math.max(serviceRequestsPerSecond || 0, loadRequestsPerSecond);
 
   return {
     service: sample.service_name,
     cpuUsage: numberOrNull(sample.cpu_percent),
     memoryUsage: numberOrNull(sample.memory_percent),
-    requestRate: loadTargetsService ? numberOrNull(load.load_current_requests_per_second) : null,
-    latencyMs: numberOrNull(sample.probe_latency_ms),
-    errorRate: loadTargetsService ? numberOrNull(load.load_error_rate) : null,
-    dbConnections: null,
+    totalRequests: numberOrNull(sample.total_requests),
+    successfulRequests: numberOrNull(sample.successful_requests),
+    failedRequests: numberOrNull(sample.failed_requests),
+    activeRequests: numberOrNull(sample.active_requests),
+    requestsLastMinute,
+    requestsPerSecond: numberOrNull(sample.requests_per_second),
+    requestRate,
+    averageLatencyMs: numberOrNull(sample.average_latency_ms),
+    p95LatencyMs: numberOrNull(sample.p95_latency_ms),
+    latencyMs: numberOrNull(sample.average_latency_ms) ?? numberOrNull(sample.probe_latency_ms),
+    errorRate: numberOrNull(sample.service_error_rate)
+      ?? (loadTargetsService ? numberOrNull(load.load_error_rate) : null),
+    dbActiveConnections: numberOrNull(sample.db_active_connections),
+    dbWaitingRequests: numberOrNull(sample.db_waiting_requests),
+    dbAverageQueryLatencyMs: numberOrNull(sample.db_average_query_latency_ms),
+    dbErrorRate: numberOrNull(sample.db_error_rate),
+    dbConnections: numberOrNull(sample.db_active_connections),
     probeLatencyMs: numberOrNull(sample.probe_latency_ms),
     probeFailures,
     restartCount: sample.restart_count === null ? null : Number(sample.restart_count),
@@ -49,6 +70,7 @@ async function buildRealMetrics(sample) {
       totalRequests: load.load_total_requests,
       successfulRequests: load.load_successful_requests,
       failedRequests: load.load_failed_requests,
+      currentRequestsPerSecond: load.load_current_requests_per_second,
       averageLatencyMs: load.load_average_latency_ms,
       errorRate: load.load_error_rate
     } : null
@@ -84,7 +106,8 @@ async function persistIncident(service, metrics, detection, prediction, classifi
     const updated = await client.query(
       `UPDATE incidents SET anomaly_score = $1, failure_probability = $2, risk_level = $3,
        evidence = $4, detected_by = $5, contributing_features = $6, classification_confidence = $7,
-       propagation_path = $8, latest_metrics = $9, anomaly_detected_at = NOW(), updated_at = NOW()
+       propagation_path = $8, latest_metrics = $9, genai_summary = NULL, genai_summary_source = NULL,
+       anomaly_detected_at = NOW(), updated_at = NOW()
        WHERE id = $10 RETURNING *`,
       [numberOrNull(detection.anomalyScore), numberOrNull(prediction.failureProbability), prediction.riskLevel || 'LOW',
         JSON.stringify(evidence), detectedBy, contributingFeatures, confidence, propagationPath, JSON.stringify(metrics), existing.id]

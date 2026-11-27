@@ -1,143 +1,125 @@
 const express = require('express');
-const dotenv = require('dotenv');
 const axios = require('axios');
-const { randomUUID } = require('crypto');
-
-dotenv.config();
+const { createServiceDatabase } = require('../common/database');
+const { createSimulationController, createTelemetry } = require('../common/telemetry');
+const logger = require('../common/logger');
 
 const app = express();
 const port = Number(process.env.PORT || 8001);
 const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || 'http://payment-service:8002';
+const simulations = createSimulationController('order-service');
+const telemetry = createTelemetry('order-service', ['/orders']);
+const database = createServiceDatabase(simulations);
 
-const metrics = {
-  service: 'order-service',
-  cpuUsage: 35,
-  memoryUsage: 45,
-  requestRate: 120,
-  latencyMs: 130,
-  errorRate: 0.2,
-  dbConnections: 12,
-  status: 'healthy',
-  failureMode: 'normal',
-  timestamp: new Date().toISOString()
-};
+app.use(express.json({ limit: '32kb' }));
+app.use(telemetry.middleware);
+app.use(simulations.middleware);
 
-function syncMetrics() {
-  metrics.timestamp = new Date().toISOString();
-  return { ...metrics, timestamp: metrics.timestamp };
-}
-
-function applyNormalVariation() {
-  if (metrics.failureMode === 'normal') {
-    metrics.cpuUsage = Math.max(20, Math.min(55, metrics.cpuUsage + (Math.random() - 0.5) * 8));
-    metrics.memoryUsage = Math.max(30, Math.min(60, metrics.memoryUsage + (Math.random() - 0.5) * 6));
-    metrics.requestRate = Math.max(70, Math.min(200, metrics.requestRate + (Math.random() - 0.5) * 30));
-    metrics.latencyMs = Math.max(80, Math.min(180, metrics.latencyMs + (Math.random() - 0.5) * 20));
-    metrics.errorRate = Math.max(0.05, Math.min(0.8, metrics.errorRate + (Math.random() - 0.5) * 0.3));
-    metrics.dbConnections = Math.max(8, Math.min(25, metrics.dbConnections + (Math.random() - 0.5) * 6));
-    metrics.status = 'healthy';
+app.get('/health', async (req, res) => {
+  try {
+    await database.checkHealth();
+    res.json({ service: 'order-service', status: 'healthy', timestamp: new Date().toISOString() });
+  } catch (error) {
+    res.status(503).json({ service: 'order-service', status: 'unavailable', error: error.message });
   }
-}
-
-setInterval(() => {
-  applyNormalVariation();
-}, 3000);
-
-app.use(express.json());
-
-app.get('/health', (req, res) => {
-  res.json({ service: 'order-service', status: 'healthy', timestamp: new Date().toISOString() });
 });
 
 app.get('/metrics', (req, res) => {
-  res.json(syncMetrics());
+  res.json({ ...telemetry.snapshot(), ...database.snapshot(), simulations: simulations.getStatus() });
 });
 
-app.post('/simulate/traffic-spike', (req, res) => {
-  metrics.cpuUsage = 88;
-  metrics.memoryUsage = 60;
-  metrics.requestRate = 4200;
-  metrics.latencyMs = 2000;
-  metrics.errorRate = 6.4;
-  metrics.dbConnections = 75;
-  metrics.status = 'warning';
-  metrics.failureMode = 'traffic_spike';
-  res.json({ service: 'order-service', status: 'simulated_traffic_spike', metrics: syncMetrics() });
-});
+app.get('/simulate/status', (req, res) => res.json(simulations.getStatus()));
 
-app.post('/simulate/database-overload', (req, res) => {
-  metrics.dbConnections = 96;
-  metrics.latencyMs = 1800;
-  metrics.errorRate = 5.1;
-  metrics.cpuUsage = 78;
-  metrics.status = 'warning';
-  metrics.failureMode = 'database_overload';
-  res.json({ service: 'order-service', status: 'simulated_database_overload', metrics: syncMetrics() });
-});
-
-app.post('/simulate/memory-leak', (req, res) => {
-  metrics.memoryUsage = 90;
-  metrics.cpuUsage = 62;
-  metrics.latencyMs = 900;
-  metrics.status = 'warning';
-  metrics.failureMode = 'memory_leak';
-  res.json({ service: 'order-service', status: 'simulated_memory_leak', metrics: syncMetrics() });
-});
-
-app.post('/simulate/cpu-overload', (req, res) => {
-  metrics.cpuUsage = 92;
-  metrics.latencyMs = 1700;
-  metrics.errorRate = 3.5;
-  metrics.status = 'warning';
-  metrics.failureMode = 'cpu_overload';
-  res.json({ service: 'order-service', status: 'simulated_cpu_overload', metrics: syncMetrics() });
-});
+for (const type of ['traffic-spike', 'database-overload', 'memory-leak', 'cpu-overload']) {
+  app.post(`/simulate/${type}`, (req, res) => {
+    try {
+      const simulation = simulations.start(type, req.body?.durationMs);
+      if (type === 'database-overload') {
+        database.runDatabaseStress().catch((error) => logger.error('database_simulation_failed', { message: error.message }));
+      }
+      res.status(202).json({ success: true, simulation, status: simulations.getStatus() });
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ success: false, error: error.message, status: simulations.getStatus() });
+    }
+  });
+}
 
 app.post('/simulate/stop', (req, res) => {
-  metrics.cpuUsage = 32;
-  metrics.memoryUsage = 44;
-  metrics.requestRate = 110;
-  metrics.latencyMs = 130;
-  metrics.errorRate = 0.2;
-  metrics.dbConnections = 12;
-  metrics.status = 'healthy';
-  metrics.failureMode = 'normal';
-  res.json({ service: 'order-service', status: 'reset_to_normal', metrics: syncMetrics() });
+  res.json({ success: true, status: simulations.stopAll() });
 });
 
-const orders = new Map();
-
 app.post('/orders', async (req, res) => {
-  const order = {
-    id: randomUUID(),
-    ...req.body,
-    createdAt: new Date().toISOString()
-  };
+  const amount = Number(req.body?.amount);
+  const rawUserId = req.body?.userId;
+  const userId = rawUserId === undefined || rawUserId === null || rawUserId === '' ? null : Number(rawUserId);
+  if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: 'amount must be a non-negative number' });
+  if (userId !== null && (!Number.isInteger(userId) || userId < 1)) {
+    return res.status(400).json({ error: 'userId must be a positive integer when provided' });
+  }
+
+  let order;
+  try {
+    const result = await database.query(
+      'INSERT INTO orders (user_id, amount, status) VALUES ($1, $2, $3) RETURNING id, user_id, amount, status, created_at',
+      [userId, amount, 'pending']
+    );
+    order = result.rows[0];
+  } catch (error) {
+    res.locals.telemetryError = error.message;
+    logger.error('order_persistence_failed', { message: error.message });
+    return res.status(503).json({ error: 'Order could not be persisted' });
+  }
 
   try {
     await axios.post(`${PAYMENT_SERVICE_URL}/payments`, {
       orderId: order.id,
-      amount: req.body.amount || 100,
+      amount: order.amount,
       status: 'processed'
     }, { timeout: 10000 });
+    const result = await database.query(
+      "UPDATE orders SET status = 'processed' WHERE id = $1 RETURNING id, user_id, amount, status, created_at",
+      [order.id]
+    );
+    return res.status(201).json(result.rows[0]);
   } catch (error) {
-    console.warn('Order service could not reach payment service:', error.message);
+    res.locals.telemetryError = error.message;
+    logger.error('order_payment_failed', { message: error.message });
+    await database.query(
+      "UPDATE orders SET status = 'payment_failed' WHERE id = $1",
+      [order.id]
+    ).catch((updateError) => logger.error('order_failure_status_update_failed', { message: updateError.message, orderId: order.id }));
+    return res.status(502).json({ error: 'Order was stored but payment processing failed', orderId: order.id });
   }
-
-  orders.set(order.id, order);
-  res.status(201).json(order);
 });
 
-app.get('/orders', (req, res) => {
-  res.json(Array.from(orders.values()));
+app.get('/orders', async (req, res) => {
+  try {
+    const result = await database.query(
+      'SELECT id, user_id, amount, status, created_at FROM orders ORDER BY created_at DESC LIMIT 500'
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.locals.telemetryError = error.message;
+    res.status(503).json({ error: 'Orders unavailable' });
+  }
 });
 
-app.get('/orders/:id', (req, res) => {
-  const order = orders.get(req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  res.json(order);
+app.get('/orders/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) return res.status(400).json({ error: 'Order id must be a positive integer' });
+  try {
+    const result = await database.query(
+      'SELECT id, user_id, amount, status, created_at FROM orders WHERE id = $1',
+      [id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Order not found' });
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.locals.telemetryError = error.message;
+    res.status(503).json({ error: 'Order unavailable' });
+  }
 });
 
 app.listen(port, () => {
-  console.log(`Order Service running on port ${port}`);
+  logger.info('order_service_started', { port });
 });

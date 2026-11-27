@@ -19,12 +19,16 @@ function createMetrics() {
   };
 }
 
-function createMetricsStore() {
+function createMetricsStore({ now = Date.now, windowMs = 1000 } = {}) {
   let metrics = createMetrics();
   let latencyTotal = 0;
   let latencyCount = 0;
-  let windowStartedAt = Date.now();
-  let windowRequests = 0;
+  let requestTimes = [];
+
+  function refreshWindow(currentTime = now()) {
+    requestTimes = requestTimes.filter((timestamp) => timestamp > currentTime - windowMs);
+    metrics.currentRequestsPerSecond = Number((requestTimes.length * 1000 / windowMs).toFixed(2));
+  }
 
   return {
     start(options) {
@@ -38,13 +42,12 @@ function createMetricsStore() {
       };
       latencyTotal = 0;
       latencyCount = 0;
-      windowStartedAt = Date.now();
-      windowRequests = 0;
+      requestTimes = [];
     },
-    record(result) {
+    record(result, timestamp = now()) {
       const latency = Number(result.latencyMs);
       metrics.totalRequests += 1;
-      windowRequests += 1;
+      requestTimes.push(timestamp);
       if (result.ok) metrics.successfulRequests += 1;
       else metrics.failedRequests += 1;
       if (Number.isFinite(latency)) {
@@ -57,9 +60,8 @@ function createMetricsStore() {
       metrics.errorRate = metrics.totalRequests
         ? Number(((metrics.failedRequests / metrics.totalRequests) * 100).toFixed(2))
         : 0;
-      const elapsedSeconds = Math.max((Date.now() - windowStartedAt) / 1000, 0.001);
-      metrics.currentRequestsPerSecond = Number((windowRequests / elapsedSeconds).toFixed(2));
-      metrics.timestamp = new Date().toISOString();
+      refreshWindow(timestamp);
+      metrics.timestamp = new Date(timestamp).toISOString();
     },
     stop() {
       metrics.active = false;
@@ -67,7 +69,9 @@ function createMetricsStore() {
       metrics.timestamp = metrics.stoppedAt;
     },
     snapshot() {
-      metrics.timestamp = new Date().toISOString();
+      const currentTime = now();
+      refreshWindow(currentTime);
+      metrics.timestamp = new Date(currentTime).toISOString();
       return { ...metrics };
     }
   };

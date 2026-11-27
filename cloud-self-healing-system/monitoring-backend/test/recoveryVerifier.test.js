@@ -3,40 +3,66 @@ const assert = require('node:assert/strict');
 
 const { verifyRecovery } = require('../src/services/recoveryVerifier');
 
-const before = {
-  cpuUsage: 80,
-  memoryUsage: 80,
-  probeLatencyMs: 200,
-  latencyMs: 200,
-  probeFailures: 10,
-  errorRate: 10,
-  requestRate: 50
-};
-
-test('marks recovered when latency and error rate both improve by at least 30 percent', () => {
-  const result = verifyRecovery(before, {
-    cpuUsage: 50,
-    memoryUsage: 60,
-    probeLatencyMs: 100,
-    latencyMs: 130,
-    probeFailures: 2,
-    errorRate: 6,
-    requestRate: 50
-  });
-  assert.equal(result.status, 'recovered');
-  assert.ok(result.effectivenessScore > 0);
-});
-
-test('marks partially recovered when latency or error rate improves but misses threshold', () => {
-  const result = verifyRecovery(before, { ...before, latencyMs: 190, errorRate: 10 });
+test('scores only meaningful threshold-qualified improvements and keeps CPU-only recovery partial', () => {
+  const result = verifyRecovery(
+    { cpuUsage: 40, memoryUsage: 1, latencyMs: 702, errorRate: 0, probeFailures: 0 },
+    { cpuUsage: 7, memoryUsage: 1, latencyMs: 699, errorRate: 0, probeFailures: 0 },
+    6,
+    30000
+  );
   assert.equal(result.status, 'partially_recovered');
+  assert.equal(result.effectivenessScore, 24.75);
+  assert.equal(result.effectivenessByMetric.cpuImprovement.thresholdMet, true);
+  assert.equal(result.effectivenessByMetric.memoryImprovement.thresholdMet, false);
+  assert.equal(result.effectivenessByMetric.latencyImprovement.thresholdMet, false);
+  assert.equal(result.effectivenessByMetric.errorRateImprovement.thresholdMet, false);
 });
 
-test('marks not recovered when no metrics improve', () => {
-  const result = verifyRecovery(before, { ...before, latencyMs: 220, errorRate: 12, cpuUsage: 90 });
+test('tiny latency changes cannot create a recovery score', () => {
+  const result = verifyRecovery(
+    { latencyMs: 702, cpuUsage: 20, memoryUsage: 10, errorRate: 0, probeFailures: 0 },
+    { latencyMs: 699, cpuUsage: 20, memoryUsage: 10, errorRate: 0, probeFailures: 0 }
+  );
   assert.equal(result.status, 'not_recovered');
+  assert.equal(result.effectivenessScore, 0);
+  assert.equal(result.effectivenessByMetric.latencyImprovement.improvementPercent, null);
 });
 
-test('marks pending when fresh metrics are unavailable', () => {
-  assert.equal(verifyRecovery(before, null).status, 'pending');
+test('applies the stated absolute CPU and memory thresholds', () => {
+  const result = verifyRecovery(
+    { cpuUsage: 40, memoryUsage: 20, latencyMs: 100, errorRate: 10, probeFailures: 4 },
+    { cpuUsage: 32, memoryUsage: 16, latencyMs: 80, errorRate: 8, probeFailures: 2 }
+  );
+  assert.equal(result.effectivenessByMetric.cpuImprovement.thresholdMet, false);
+  assert.equal(result.effectivenessByMetric.memoryImprovement.thresholdMet, false);
+  assert.equal(result.effectivenessByMetric.latencyImprovement.thresholdMet, true);
+  assert.equal(result.effectivenessByMetric.errorRateImprovement.thresholdMet, true);
+  assert.equal(result.effectivenessByMetric.probeHealthImprovement.thresholdMet, true);
+});
+
+test('marks recovery complete only when weighted meaningful improvements reach the threshold', () => {
+  const result = verifyRecovery(
+    { cpuUsage: 80, memoryUsage: 80, latencyMs: 200, errorRate: 10, probeFailures: 10 },
+    { cpuUsage: 8, memoryUsage: 8, latencyMs: 20, errorRate: 1, probeFailures: 0 }
+  );
+  assert.equal(result.status, 'recovered');
+  assert.equal(result.effectivenessScore, 91);
+});
+
+test('requires at least 50 percent fewer probe failures or zero remaining failures', () => {
+  const partial = verifyRecovery(
+    { probeFailures: 10 },
+    { probeFailures: 6 }
+  );
+  const improved = verifyRecovery(
+    { probeFailures: 10 },
+    { probeFailures: 5 }
+  );
+  assert.equal(partial.effectivenessByMetric.probeHealthImprovement.thresholdMet, false);
+  assert.equal(improved.effectivenessByMetric.probeHealthImprovement.thresholdMet, true);
+});
+
+test('keeps verification pending when metrics cannot be compared', () => {
+  assert.equal(verifyRecovery({ cpuUsage: 1 }, { cpuUsage: null }).status, 'verification_pending');
+  assert.equal(verifyRecovery({ cpuUsage: 20 }, null).status, 'verification_pending');
 });

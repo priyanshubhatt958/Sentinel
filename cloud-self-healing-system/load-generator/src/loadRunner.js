@@ -1,38 +1,47 @@
 const { targetUrls, validateStartOptions } = require('./config');
 const { sendRequest } = require('./httpClient');
 const { createMetricsStore } = require('./metrics');
+const logger = require('./logger');
 
-function createLoadRunner() {
-  const metrics = createMetricsStore();
+function createLoadRunner({ requestSender = sendRequest, now = Date.now } = {}) {
+  const metrics = createMetricsStore({ now });
   let active = false;
-  let interval = null;
+  let requestTimer = null;
   let durationTimer = null;
   let options = null;
   let targetIndex = 0;
+  let runStartedAt = null;
+  let nextRequestAt = null;
+  let runController = null;
 
   function targetList() {
     return options.targetService === 'all' ? Object.keys(targetUrls) : [options.targetService];
   }
 
-  async function sendBatch() {
+  function scheduleRequest() {
     if (!active) return;
-    const targets = targetList();
-    const requestsThisTick = Math.max(1, Math.round(options.requestsPerSecond / 10));
-    const requests = Array.from({ length: requestsThisTick }, (_, index) => {
-      const service = targets[(targetIndex + index) % targets.length];
-      return sendRequest(service, targetUrls[service], options.scenario).then((result) => metrics.record(result));
-    });
-    targetIndex = (targetIndex + requestsThisTick) % targets.length;
-    await Promise.all(requests);
+    const targetTime = nextRequestAt;
+    requestTimer = setTimeout(() => {
+      if (!active) return;
+      const targets = targetList();
+      const service = targets[targetIndex % targets.length];
+      targetIndex += 1;
+      requestSender(service, targetUrls[service], options.scenario, { signal: runController.signal })
+        .then((result) => metrics.record(result))
+        .catch((error) => logger.error('load_request_failed', { service, message: error.message }));
+      nextRequestAt = Math.max(targetTime, now()) + (1000 / options.requestsPerSecond);
+      scheduleRequest();
+    }, Math.max(0, targetTime - now()));
   }
 
   function finish() {
     if (!active) return;
     active = false;
-    clearInterval(interval);
+    clearTimeout(requestTimer);
     clearTimeout(durationTimer);
-    interval = null;
+    requestTimer = null;
     durationTimer = null;
+    if (runController && !runController.signal.aborted) runController.abort();
     metrics.stop();
   }
 
@@ -46,10 +55,11 @@ function createLoadRunner() {
       options = validateStartOptions(input);
       active = true;
       targetIndex = 0;
+      runStartedAt = now();
+      nextRequestAt = runStartedAt;
+      runController = new AbortController();
       metrics.start(options);
-      interval = setInterval(() => {
-        sendBatch().catch((error) => console.error(`Load batch failed: ${error.message}`));
-      }, 100);
+      scheduleRequest();
       durationTimer = setTimeout(finish, options.durationSeconds * 1000);
       return metrics.snapshot();
     },
